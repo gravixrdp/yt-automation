@@ -906,14 +906,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Force scrape ──────────────────────────────────────────
     elif data.startswith("src_scrape:"):
         tab = data.split(":", 1)[1]
-        # Create a trigger file that the scraper can watch for
+        # If already running, show status instead of re-trigger
+        status = _read_scrape_status(tab)
+        if status and status.get("state") == "running":
+            await query.edit_message_text(
+                _format_scrape_status(tab, status),
+                parse_mode="Markdown",
+            )
+            return
+        # Create a trigger file that the scraper loop can watch for
         trigger_file = scheduler_config.TEMP_DIR / f"trigger_scrape_{tab}.flag"
         trigger_file.write_text(datetime.now(timezone.utc).isoformat())
-        await query.edit_message_text(
-            f"🔄 Scrape triggered for `{tab}`.\n"
-            f"Trigger file written. Run scraper to process.",
-            parse_mode="Markdown",
-        )
+        msg = f"🔄 Scrape queued for `{tab}`."
+        if status:
+            msg += "\n\n" + _format_scrape_status(tab, status)
+        await query.edit_message_text(msg, parse_mode="Markdown")
 
     # ── Force upload ──────────────────────────────────────────
     elif data.startswith("force_upload:"):
