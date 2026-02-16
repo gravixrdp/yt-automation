@@ -10,7 +10,7 @@ import fcntl
 REPO_DIR = Path(__file__).resolve().parent
 LOG_FILE = REPO_DIR / "logs" / "auto_commit.log"
 LOCK_FILE = Path("/tmp/gravix_autocommit.lock")
-POLL_SECONDS = 5
+POLL_SECONDS = 3600
 
 
 def _log(msg: str):
@@ -49,7 +49,7 @@ def main():
         except OSError:
             return
 
-        _log("auto-commit watcher started")
+        _log("auto-commit watcher started (hourly)")
         while True:
             try:
                 if _has_changes():
