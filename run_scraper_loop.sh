@@ -1,0 +1,35 @@
+#!/bin/bash
+# run_scraper_loop.sh — Run scraper periodically (every 1 hour)
+
+# Ensure log dir exists
+mkdir -p /home/ubuntu/gravix-agent/logs
+
+# Source environment
+cd /home/ubuntu/gravix-agent
+# source .env  # (Scraper loads .env via python-dotenv, but sourcing here helps too)
+
+while true; do
+  echo "[$(date)] Starting Scraper Run..."
+  /home/ubuntu/gravix-agent/venv/bin/python3 /home/ubuntu/gravix-agent/scraper.py --batch >> /home/ubuntu/gravix-agent/logs/scraper_loop.log 2>&1
+  
+  EXIT_CODE=$?
+  echo "[$(date)] Scraper finished with exit code $EXIT_CODE."
+  
+  if [ $EXIT_CODE -ne 0 ]; then
+    echo "Scraper failed! Sleeping 5m before retry..."
+    sleep 300
+  else
+    # Read interval from file (default: 3600)
+    INTERVAL_FILE="/home/ubuntu/gravix-agent/scraper_interval.txt"
+    INTERVAL=3600
+    if [ -f "$INTERVAL_FILE" ]; then
+      READ_VAL=$(cat "$INTERVAL_FILE")
+      if [[ "$READ_VAL" =~ ^[0-9]+$ ]]; then
+        INTERVAL=$READ_VAL
+      fi
+    fi
+    
+    echo "Sleeping $INTERVAL seconds..."
+    sleep $INTERVAL
+  fi
+done

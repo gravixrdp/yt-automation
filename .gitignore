@@ -1,0 +1,25 @@
+.env
+service_account.json
+logs/
+__pycache__/
+*.pyc
+venv/
+/tmp/shorts_ingest/
+/tmp/shorts_upload/
+secrets/
+queue.db
+
+# Local runtime artifacts
+*.log
+*.jsonl
+*.db
+backups/
+.pytest_cache/
+bot.log
+scheduler.log
+scraper.log
+scraper_service.log
+scheduler_service.log
+
+# Google/Gemini client/service files (keep .env.example only)
+gen-lang-client-*.json

@@ -1,0 +1,13 @@
+- source_tab: source__modox_recap
+  source_type: youtube
+  source_id: UC4AzlDqHa10XbeLvwN0FLZg
+  scrape_interval_minutes: 360
+  max_new_per_run: 300
+  rate_limit_seconds: 3
+
+- source_tab: source__apna_scenario
+  source_type: youtube
+  source_id: UCWz_IK_f-EaUe0DdDnSOXAQ
+  scrape_interval_minutes: 360
+  max_new_per_run: 300
+  rate_limit_seconds: 3
