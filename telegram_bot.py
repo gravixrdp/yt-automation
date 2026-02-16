@@ -1415,7 +1415,7 @@ async def _complete_add_source(update: Update, platform: str, raw_id: str, tab_o
         "source_tab": tab_name,
         "source_type": platform,
         "source_id": source_id,
-        "scrape_interval_minutes": 360,
+        "scrape_interval_minutes": 0,
         "max_new_per_run": 0,
         "rate_limit_seconds": 3,
     }
