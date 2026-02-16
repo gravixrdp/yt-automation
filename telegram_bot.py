@@ -915,11 +915,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await query.edit_message_text(
-            f"📁 *{tab}*\n\n"
-            f"⏳ PENDING: {pending}\n"
-            f"🚀 READY_TO_UPLOAD: {ready}\n"
-            f"✅ UPLOADED: {uploaded}\n"
-            f"❌ ERROR: {errors}",
+            f"📁 *{_md_escape(tab)}*\n\n"
+            f"⏳ `PENDING`: {pending}\n"
+            f"🚀 `READY_TO_UPLOAD`: {ready}\n"
+            f"✅ `UPLOADED`: {uploaded}\n"
+            f"❌ `ERROR`: {errors}",
             parse_mode="Markdown",
         )
 
@@ -944,7 +944,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
 
         await query.edit_message_text(
-            f"🔗 Mapping `{tab}` → Select destination:",
+            f"🔗 Mapping `{_md_escape(tab)}` → Select destination:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
@@ -965,7 +965,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )])
         keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
         await query.edit_message_text(
-            f"🔗 Mapping `{tab}` → Select destination:",
+            f"🔗 Mapping `{_md_escape(tab)}` → Select destination:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
@@ -981,7 +981,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
         ]
         await query.edit_message_text(
-            f"Map `{tab}` → `{dest_id}`\nApply to:",
+            f"Map `{_md_escape(tab)}` → `{_md_escape(dest_id)}`\nApply to:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
@@ -1005,10 +1005,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sheet_manager.write_global_mapping(tab, dest_id, platform, sheets)
 
             await query.edit_message_text(
-                f"✅ Mapped `{tab}` → `{dest_id}`\n"
-                f"Updated {len(row_numbers)} rows (PENDING/READY/ERROR, col W)\n"
-                f"Range: `{tab}!W2:W{max(row_numbers) if row_numbers else 2}`\n"
-                f"Global mapping also written to destinations_mapping.",
+                f"✅ Mapped `{_md_escape(tab)}` → `{_md_escape(dest_id)}`\n"
+                f"Updated {len(row_numbers)} rows (`PENDING`/`READY_TO_UPLOAD`/`ERROR`, col W)\n"
+                f"Range: `{_md_escape(tab)}!W2:W{max(row_numbers) if row_numbers else 2}`\n"
+                f"Global mapping also written to `destinations_mapping`.",
                 parse_mode="Markdown",
             )
         except Exception as e:
@@ -1042,7 +1042,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sheet_manager.update_row_status(tab, sheet_row, "READY_TO_UPLOAD", sheets=sheets)
             sheet_manager.append_audit_note(tab, sheet_row, "admin: force upload via Telegram", sheets)
             await query.edit_message_text(
-                f"🚀 Row {sheet_row} in `{tab}` set to READY_TO_UPLOAD.\n"
+                f"🚀 Row {sheet_row} in `{_md_escape(tab)}` set to `READY_TO_UPLOAD`.\n"
                 f"Scheduler will pick it up on next poll.",
                 parse_mode="Markdown",
             )
@@ -1063,7 +1063,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )])
         keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
         await query.edit_message_text(
-            f"Map row {sheet_row} in `{tab}` to:",
+            f"Map row {sheet_row} in `{_md_escape(tab)}` to:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
@@ -1074,7 +1074,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tab, sheet_row = parts[1], int(parts[2])
         keyboard = _schedule_picker_keyboard(tab, sheet_row)
         await query.edit_message_text(
-            f"Pick schedule for row {sheet_row} in `{tab}`:",
+            f"Pick schedule for row {sheet_row} in `{_md_escape(tab)}`:",
             reply_markup=keyboard,
             parse_mode="Markdown",
         )
@@ -1108,8 +1108,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sheets = sheet_manager.get_service()
             sheet_manager.write_dest_mapping(tab, [sheet_row], dest_id, sheets)
             await query.edit_message_text(
-                f"✅ Row {sheet_row} in `{tab}` mapped to `{dest_id}`.\n"
-                f"Updated cell `{tab}!W{sheet_row}`.",
+                f"✅ Row {sheet_row} in `{_md_escape(tab)}` mapped to `{_md_escape(dest_id)}`.\n"
+                f"Updated cell `{_md_escape(tab)}!W{sheet_row}`.",
                 parse_mode="Markdown",
             )
         except Exception as e:
