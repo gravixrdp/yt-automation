@@ -661,7 +661,7 @@ def process_source(
             _write_scrape_status(tab_name, {
                 "tab": tab_name,
                 "state": "running",
-                "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "started_at": started_at,
                 "fetched": stats["fetched"],
                 "inserted": stats["inserted"],
                 "skipped_duplicate": stats["skipped_duplicate"],
