@@ -1633,6 +1633,7 @@ def cmd_help_text():
         "*Configuration & Control:*\n"
         "*/set_interval <time>* — Use '5d', '1h'\n"
         "*/scrape_now* — Trigger scraper immediately\n"
+        "*/scrape_status [tab]* — Scraper progress\n"
         "*/services <action> <target>* — Manage system\n"
         "*/add_source <platform> <channel_url_or_id>* — Quick add YouTube/Instagram source\n"
         "*/ai <row_id>* — Generate AI title/desc/hashtags for a row\n"
