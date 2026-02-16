@@ -102,6 +102,21 @@ def _release_scrape_lock(tab_name: str) -> None:
             pass
 
 
+def _parse_utc(value: str) -> datetime | None:
+    if not value:
+        return None
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 # ── Scrapingdog key rotation ─────────────────────────────────────
 
 class KeyRotator:
