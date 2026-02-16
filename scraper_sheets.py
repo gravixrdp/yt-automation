@@ -310,3 +310,24 @@ def update_master_index(tab_name: str, source_type: str, source_id: str, sheets=
         "Updated master_index: %s → %d rows, scraped at %s",
         tab_name, row_count, now,
     )
+
+
+def get_master_index_entry(tab_name: str, sheets=None) -> dict | None:
+    """Fetch master_index row for a source tab."""
+    sheets = sheets or get_service()
+    try:
+        result = sheets.values().get(
+            spreadsheetId=scraper_config.SPREADSHEET_ID,
+            range=f"'{scraper_config.TAB_MASTER_INDEX}'!A:F",
+        ).execute()
+    except HttpError:
+        return None
+    rows = result.get("values", [])
+    if len(rows) < 2:
+        return None
+    headers = rows[0]
+    for row in rows[1:]:
+        if row and row[0] == tab_name:
+            padded = row + [""] * (len(headers) - len(row))
+            return dict(zip(headers, padded))
+    return None
