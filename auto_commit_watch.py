@@ -16,7 +16,12 @@ POLL_SECONDS = 5
 def _log(msg: str):
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    LOG_FILE.write_text(f"[{ts}] {msg}\n", encoding="utf-8") if not LOG_FILE.exists() else LOG_FILE.open("a", encoding="utf-8").write(f"[{ts}] {msg}\n")
+    line = f"[{ts}] {msg}\n"
+    if not LOG_FILE.exists():
+        LOG_FILE.write_text(line, encoding="utf-8")
+        return
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(line)
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
