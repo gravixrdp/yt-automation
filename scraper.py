@@ -63,6 +63,45 @@ def log_event(event_type: str, **kwargs):
     json_logger.info(json.dumps(entry, ensure_ascii=False))
 
 
+def _status_path(tab_name: str) -> Path:
+    return scraper_config.SCRAPE_STATUS_DIR / f"{tab_name}.json"
+
+
+def _lock_path(tab_name: str) -> Path:
+    return scraper_config.SCRAPE_STATUS_DIR / f"{tab_name}.lock"
+
+
+def _write_scrape_status(tab_name: str, data: dict) -> None:
+    data["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = _status_path(tab_name)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _acquire_scrape_lock(tab_name: str) -> bool:
+    lock = _lock_path(tab_name)
+    if lock.exists():
+        age = time.time() - lock.stat().st_mtime
+        if age < scraper_config.SCRAPE_LOCK_TIMEOUT_MINUTES * 60:
+            return False
+        try:
+            lock.unlink()
+        except OSError:
+            return False
+    lock.write_text(str(os.getpid()), encoding="utf-8")
+    return True
+
+
+def _release_scrape_lock(tab_name: str) -> None:
+    lock = _lock_path(tab_name)
+    if lock.exists():
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
 # ── Scrapingdog key rotation ─────────────────────────────────────
 
 class KeyRotator:
