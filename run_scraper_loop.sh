@@ -47,6 +47,20 @@ while true; do
     fi
     
     echo "Sleeping $INTERVAL seconds..."
-    sleep $INTERVAL
+    SLEPT=0
+    while [ "$SLEPT" -lt "$INTERVAL" ]; do
+      # check for new trigger flags every 30s
+      for flag in /tmp/shorts_upload/*/trigger_scrape_*.flag /tmp/shorts_ingest/*/trigger_scrape_*.flag; do
+        [ -e "$flag" ] || continue
+        tab_name=$(basename "$flag")
+        tab_name="${tab_name#trigger_scrape_}"
+        tab_name="${tab_name%.flag}"
+        echo "[$(date)] Triggered scrape for $tab_name"
+        /home/ubuntu/gravix-agent/venv/bin/python3 /home/ubuntu/gravix-agent/scraper.py --source "$tab_name" >> /home/ubuntu/gravix-agent/logs/scraper_loop.log 2>&1
+        rm -f "$flag"
+      done
+      sleep 30
+      SLEPT=$((SLEPT + 30))
+    done
   fi
 done

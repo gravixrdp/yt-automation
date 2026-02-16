@@ -216,32 +216,82 @@ def _youtube_category_id(category_name: str) -> str:
     return _YT_CATEGORY_MAP.get(category_name, _YT_CATEGORY_MAP.get(category_name.title(), "22"))
 
 
-def _slot_times_for_day(day_local: date) -> list[datetime]:
+def _read_upload_slots_file() -> list[tuple[int, int]]:
+    path = scheduler_config.UPLOAD_SLOTS_FILE
+    if not path.exists():
+        return []
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return []
+    slots = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        h, m = part.split(":", 1)
+        try:
+            hour = int(h)
+            minute = int(m)
+        except ValueError:
+            continue
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            slots.append((hour, minute))
+    return slots
+
+
+def _get_upload_slots_local() -> list[tuple[int, int]]:
+    slots = _read_upload_slots_file()
+    if slots:
+        return slots
+    return scheduler_config.UPLOAD_SLOTS_LOCAL
+
+
+def _slot_times_for_day(day_local: date, slots_local: list[tuple[int, int]]) -> list[datetime]:
     """Return list of slot datetimes in UTC for a given local day."""
     tz = ZoneInfo(scheduler_config.DISPLAY_TIMEZONE)
     slots = []
-    for hour, minute in scheduler_config.UPLOAD_SLOTS_LOCAL:
+    for hour, minute in slots_local:
         dt_local = datetime(day_local.year, day_local.month, day_local.day, hour, minute, tzinfo=tz)
         slots.append(dt_local.astimezone(timezone.utc))
     return slots
 
 
-def _next_slot_time(uploads_today: int) -> datetime:
-    """Given uploads_today, return the UTC datetime of the required slot (today or tomorrow)."""
-    now_local = datetime.now(ZoneInfo(scheduler_config.DISPLAY_TIMEZONE))
-    today_slots = _slot_times_for_day(now_local.date())
-    max_slots_today = min(len(today_slots), scheduler_config.UPLOADS_PER_DAY_PER_DEST)
+def _next_slot_time(now_utc: datetime | None = None) -> datetime:
+    """Return the next upcoming slot datetime in UTC (>= now)."""
+    slots_local = _get_upload_slots_local()
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if not slots_local:
+        return now_utc + timedelta(hours=24)
 
-    if uploads_today < max_slots_today:
-        return today_slots[uploads_today]
+    tz = ZoneInfo(scheduler_config.DISPLAY_TIMEZONE)
+    now_local = now_utc.astimezone(tz)
+    today_slots = _slot_times_for_day(now_local.date(), slots_local)
+    for slot in today_slots:
+        if slot >= now_utc:
+            return slot
 
-    # Move to tomorrow's first slot
     tomorrow = now_local.date() + timedelta(days=1)
-    tomorrow_slots = _slot_times_for_day(tomorrow)
-    if not tomorrow_slots:
-        # Fallback: 24h later
-        return datetime.now(timezone.utc) + timedelta(hours=24)
-    return tomorrow_slots[0]
+    tomorrow_slots = _slot_times_for_day(tomorrow, slots_local)
+    if tomorrow_slots:
+        return tomorrow_slots[0]
+    # Fallback: 24h later
+    return now_utc + timedelta(hours=24)
+
+
+def _first_slot_tomorrow(now_utc: datetime | None = None) -> datetime:
+    """Return the first slot for tomorrow in UTC."""
+    slots_local = _get_upload_slots_local()
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if not slots_local:
+        return now_utc + timedelta(hours=24)
+
+    tz = ZoneInfo(scheduler_config.DISPLAY_TIMEZONE)
+    tomorrow = now_utc.astimezone(tz).date() + timedelta(days=1)
+    tomorrow_slots = _slot_times_for_day(tomorrow, slots_local)
+    if tomorrow_slots:
+        return tomorrow_slots[0]
+    # Fallback: 24h later
+    return now_utc + timedelta(hours=24)
 
 
 # ── Core scheduler logic ─────────────────────────────────────────
@@ -466,8 +516,15 @@ def process_upload_job(job: dict) -> dict:
             pass
     # Step 4b: Enforce fixed daily slots & cap
     uploads_today = queue_db.get_uploads_today(dest_account_id)
-    slot_time = _next_slot_time(uploads_today)
     now_utc = datetime.now(timezone.utc)
+    if uploads_today >= scheduler_config.UPLOADS_PER_DAY_PER_DEST:
+        tomorrow_slot = _first_slot_tomorrow(now_utc)
+        queue_db.requeue_at(queue_id, tomorrow_slot.isoformat())
+        result["status"] = "deferred_slot_cap"
+        result["slot_time"] = tomorrow_slot.isoformat()
+        return result
+
+    slot_time = _next_slot_time(now_utc)
     if now_utc < slot_time:
         queue_db.requeue_at(queue_id, slot_time.isoformat())
         try:
@@ -480,12 +537,6 @@ def process_upload_job(job: dict) -> dict:
             pass
         result["status"] = "deferred_slot_wait"
         result["slot_time"] = slot_time.isoformat()
-        return result
-    if uploads_today >= scheduler_config.UPLOADS_PER_DAY_PER_DEST:
-        tomorrow_slot = _next_slot_time(uploads_today)
-        queue_db.requeue_at(queue_id, tomorrow_slot.isoformat())
-        result["status"] = "deferred_slot_cap"
-        result["slot_time"] = tomorrow_slot.isoformat()
         return result
 
     # Step 5: Download media

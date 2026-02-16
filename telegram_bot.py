@@ -233,6 +233,18 @@ def _clear_pending(uid: int):
     """Drop any stored multi-step flow state for a user."""
     _pending_actions.pop(uid, None)
 
+def _md_escape(text: str) -> str:
+    if not text:
+        return ""
+    return (text
+        .replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
+
 
 def _read_scrape_status(tab: str) -> dict | None:
     try:
@@ -245,17 +257,50 @@ def _read_scrape_status(tab: str) -> dict | None:
         return None
 
 
+def _parse_slots(text: str) -> list[str]:
+    slots = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        h, m = part.split(":", 1)
+        if not (h.isdigit() and m.isdigit()):
+            continue
+        hour = int(h)
+        minute = int(m)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            slots.append(f"{hour:02d}:{minute:02d}")
+    return slots
+
+
+def _read_upload_slots() -> list[str]:
+    path = scheduler_config.UPLOAD_SLOTS_FILE
+    if not path.exists():
+        return [f"{h:02d}:{m:02d}" for h, m in scheduler_config.UPLOAD_SLOTS_LOCAL]
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return [f"{h:02d}:{m:02d}" for h, m in scheduler_config.UPLOAD_SLOTS_LOCAL]
+    return _parse_slots(raw)
+
+
+def _write_upload_slots(slots: list[str]) -> None:
+    path = scheduler_config.UPLOAD_SLOTS_FILE
+    path.write_text(",".join(slots), encoding="utf-8")
+
+
 def _format_scrape_status(tab: str, status: dict) -> str:
-    state = status.get("state", "unknown")
+    state = _md_escape(status.get("state", "unknown"))
     fetched = status.get("fetched", 0)
     inserted = status.get("inserted", 0)
     skipped = status.get("skipped_duplicate", 0)
     errors = status.get("errors", 0)
     updated = status.get("updated_at", "N/A")
+    next_allowed = status.get("next_allowed", "")
     return (
-        f"📥 *{tab}* — {state}\n"
+        f"📥 *{_md_escape(tab)}* — {state}\n"
         f"Fetched: {fetched} | Inserted: {inserted} | Skipped: {skipped} | Errors: {errors}\n"
-        f"Updated: {updated}"
+        f"Updated: {_md_escape(updated)}"
+        + (f"\nNext allowed: {_md_escape(next_allowed)}" if next_allowed else "")
     )
 
 # ── Check if python-telegram-bot is available ─────────────────────
@@ -310,6 +355,9 @@ def get_main_menu_keyboard():
             InlineKeyboardButton("📤 Destinations", callback_data="destinations"),
         ],
         [
+            InlineKeyboardButton("🗺 Mappings", callback_data="mappings"),
+        ],
+        [
             InlineKeyboardButton("❌ Errors", callback_data="view_errors"),
             InlineKeyboardButton("❓ Help", callback_data="help"),
         ],
@@ -326,10 +374,12 @@ def get_sticky_keyboard():
     keyboard = [
         ["📊 Status", "🏥 Health"],
         ["📥 Sources", "📤 Destinations"],
+        ["🗺 Mappings"],
         ["❌ Errors", "❓ Help"],
         ["🔄 Scrape Now", "⚙️ Services"],
         ["➕ Add Source", "🧠 AI Titles"],
         ["🧾 Scrape Status"],
+        ["🕒 Upload Slots"],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -363,6 +413,8 @@ async def handle_reply_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await cmd_sources(update, context)
     elif text == "📤 Destinations":
         await cmd_destinations(update, context)
+    elif text == "🗺 Mappings":
+        await cmd_mappings(update, context)
     elif text == "❌ Errors":
         await cmd_errors(update, context)
     elif text == "❓ Help":
@@ -383,6 +435,8 @@ async def handle_reply_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await cmd_ai_prompt(update, context)
     elif text == "🧾 Scrape Status":
         await cmd_scrape_status(update, context)
+    elif text == "🕒 Upload Slots":
+        await cmd_upload_slots(update, context)
     elif update.effective_user and update.effective_user.id in _pending_actions:
         await handle_pending_flow(update, context)
     else:
@@ -421,7 +475,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for acc in accounts:
         status_icon = "✅" if acc.get("token_valid") else "❌"
-        msg += f"  {status_icon} {acc['account_name']} ({acc['platform']})\n"
+        name = _md_escape(acc.get("account_name", ""))
+        platform = _md_escape(acc.get("platform", ""))
+        msg += f"  {status_icon} {name} ({platform})\n"
 
     await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
@@ -540,10 +596,10 @@ async def cmd_row(update: Update, context: ContextTypes.DEFAULT_TYPE):
     scheduled_txt = _to_display_tz(scheduled_dt.isoformat()) if scheduled_dt else "Not Scheduled"
 
     msg = (
-        f"📋 *Row {row_id}* in `{found_tab}`\n\n"
-        f"*Title:* {found_row.get('original_title', 'N/A')[:60]}\n"
-        f"*URL:* {found_row.get('source_url', 'N/A')}\n"
-        f"*Status:* {found_row.get('status', 'N/A')}\n"
+        f"📋 *Row {row_id}* in `{_md_escape(found_tab)}`\n\n"
+        f"*Title:* {_md_escape(str(found_row.get('original_title', 'N/A'))[:60])}\n"
+        f"*URL:* {_md_escape(str(found_row.get('source_url', 'N/A')))}\n"
+        f"*Status:* {_md_escape(str(found_row.get('status', 'N/A')))}\n"
         f"*Duration:* {found_row.get('duration_seconds', '?')}s\n"
         f"*Views:* {found_row.get('view_count', '?')}\n"
         f"*Dest:* {found_row.get('dest_mapping_tags', 'unmapped')}\n"
@@ -639,36 +695,89 @@ async def cmd_map_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cmd_mappings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/mappings — Show all current source→destination mappings."""
-    msg = "🗺 *Current Mappings*\n\n"
+    lines = ["🗺 *Current Mappings*", ""]
 
-    # Static mappings from config (#10)
-    static = scheduler_config.STATIC_MAPPINGS
-    if static:
-        msg += "*Static (config-driven):*\n"
-        for src, dest in static.items():
-            msg += f"  📌 `{src}` → `{dest}`\n"
-        msg += "\n"
-    else:
-        msg += "*Static:* None configured\n\n"
+    sources = _read_sources_yaml()
+    src_info = {
+        s.get("source_tab", ""): s
+        for s in sources
+        if isinstance(s, dict) and s.get("source_tab")
+    }
+    src_order = [s.get("source_tab") for s in sources if s.get("source_tab")]
 
-    # Dynamic mappings from sheet
+    accounts = oauth_helper.get_all_accounts()
+    dest_name_by_id = {
+        a.get("account_id", ""): a.get("account_name", a.get("account_id", ""))
+        for a in accounts
+        if a.get("account_id")
+    }
+
+    static = scheduler_config.STATIC_MAPPINGS or {}
+    dynamic = []
     try:
         sheets = sheet_manager.get_service()
         dynamic = sheet_manager.get_destination_mappings(sheets)
-        if dynamic:
-            msg += "*Dynamic (per-tab overrides):*\n"
-            for m in dynamic:
-                src = m.get("source_tag", "?")
-                dest = m.get("destination_account_id", "?")
-                platform = m.get("platform", "?")
-                msg += f"  🔗 `{src}` → `{dest}` ({platform})\n"
-        else:
-            msg += "*Dynamic:* None set\n"
     except Exception as e:
-        msg += f"*Dynamic:* Error reading: {e}\n"
+        lines.append(f"*Dynamic:* Error reading: {_md_escape(str(e))}")
+        dynamic = []
 
-    msg += "\n_Per-row overrides (col W) take priority over all._"
-    await update.effective_message.reply_text(msg, parse_mode="Markdown")
+    dynamic_map = {}
+    for m in dynamic:
+        src = m.get("source_tag", "")
+        if src:
+            dynamic_map[src] = m
+
+    if src_order:
+        lines.append("*By Source:*")
+        for tab in src_order:
+            info = src_info.get(tab, {})
+            src_id = str(info.get("source_id", "") or "").strip()
+            src_label = f"`{_md_escape(tab)}`"
+            if src_id:
+                src_label += f" ({_md_escape(src_id)})"
+
+            dest_id = ""
+            platform = ""
+            if tab in dynamic_map:
+                dest_id = str(dynamic_map[tab].get("destination_account_id", "") or "").strip()
+                platform = str(dynamic_map[tab].get("platform", "") or "").strip()
+            elif tab in static:
+                dest_id = str(static.get(tab, "") or "").strip()
+                platform = "static"
+
+            if dest_id:
+                dest_name = dest_name_by_id.get(dest_id, dest_id)
+                suffix = f" ({_md_escape(platform)})" if platform else ""
+                lines.append(
+                    f"  ✅ {src_label} → {_md_escape(dest_name)} (`{_md_escape(dest_id)}`){suffix}"
+                )
+            else:
+                lines.append(f"  ⚠️ {src_label} → _unmapped_")
+        lines.append("")
+
+    # Additional mappings not tied to current sources.yaml
+    extra_dynamic = [m for m in dynamic if m.get("source_tag") not in src_info]
+    if extra_dynamic:
+        lines.append("*Other Dynamic Mappings:*")
+        for m in extra_dynamic:
+            src = m.get("source_tag", "?")
+            dest = m.get("destination_account_id", "?")
+            platform = m.get("platform", "?")
+            lines.append(
+                f"  🔗 `{_md_escape(src)}` → `{_md_escape(dest)}` ({_md_escape(platform)})"
+            )
+        lines.append("")
+
+    if not static and not dynamic and not src_order:
+        lines.append("_No mappings found._")
+
+    lines.append("_Per-row overrides (col W) take priority over all._")
+    msg = "\n".join(lines)
+    try:
+        await update.effective_message.reply_text(msg, parse_mode="Markdown")
+    except Exception:
+        # Fallback to plain text if Markdown fails
+        await update.effective_message.reply_text(msg)
 
 
 @admin_only
@@ -780,6 +889,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_sources(update, context)
     elif data == "destinations":
         await cmd_destinations(update, context)
+    elif data == "mappings":
+        await cmd_mappings(update, context)
     elif data == "view_errors":
         await cmd_errors(update, context)
     elif data == "help":
@@ -1089,8 +1200,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         uploads_today = queue_db.get_uploads_today(account_id)
         msg = (
-            f"🎯 *{account.get('account_name', account_id)}*\n\n"
-            f"Platform: {account.get('platform')}\n"
+            f"🎯 *{_md_escape(account.get('account_name', account_id))}*\n\n"
+            f"Platform: {_md_escape(account.get('platform', ''))}\n"
             f"Status: {account.get('status')}\n"
             f"Token Valid: {'✅' if account.get('token_valid') else '❌'}\n"
             f"Connected: {account.get('connected_at', 'N/A')[:10]}\n"
@@ -1386,6 +1497,20 @@ async def handle_pending_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         _clear_pending(uid)
         return
 
+    if action == "set_slots":
+        slots = _parse_slots(text)
+        if not slots:
+            await update.effective_message.reply_text(
+                "Invalid format. Send like: 09:00,12:00,15:00,18:00"
+            )
+            return
+        _write_upload_slots(slots)
+        await update.effective_message.reply_text(
+            f"✅ Upload slots updated: {', '.join(slots)}"
+        )
+        _clear_pending(uid)
+        return
+
     # Unknown/expired
     await update.effective_message.reply_text("No active action. Use the menu buttons.")
 
@@ -1415,9 +1540,9 @@ async def _complete_add_source(update: Update, platform: str, raw_id: str, tab_o
         "source_tab": tab_name,
         "source_type": platform,
         "source_id": source_id,
-        "scrape_interval_minutes": 0,
+        "scrape_interval_minutes": 10,
         "max_new_per_run": 0,
-        "rate_limit_seconds": 3,
+        "rate_limit_seconds": 0,
     }
     rows.append(new_entry)
     try:
@@ -1552,6 +1677,20 @@ async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
+@admin_only
+async def cmd_upload_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/upload_slots — Show and set upload time slots."""
+    slots = _read_upload_slots()
+    await update.effective_message.reply_text(
+        "Current upload slots (local time):\n"
+        f"{', '.join(slots)}\n"
+        f"Timezone: {scheduler_config.DISPLAY_TIMEZONE}\n\n"
+        "Uploads run on these exact slot times (no random timing).\n"
+        "Send new slots as CSV (HH:MM), e.g.:\n"
+        "09:00,12:00,15:00,18:00"
+    )
+    _pending_actions[update.effective_user.id] = {"action": "set_slots"}
+
 
 @admin_only
 async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1641,6 +1780,7 @@ def cmd_help_text():
         "*/set_interval <time>* — Use '5d', '1h'\n"
         "*/scrape_now* — Trigger scraper immediately\n"
         "*/scrape_status [tab]* — Scraper progress\n"
+        "*/upload_slots* — View/set upload times\n"
         "*/services <action> <target>* — Manage system\n"
         "*/add_source <platform> <channel_url_or_id>* — Quick add YouTube/Instagram source\n"
         "*/ai <row_id>* — Generate AI title/desc/hashtags for a row\n"
@@ -1688,6 +1828,7 @@ def create_bot_app():
     app.add_handler(CommandHandler("set_interval", cmd_set_interval))
     app.add_handler(CommandHandler("scrape_now", cmd_scrape_now))
     app.add_handler(CommandHandler("scrape_status", cmd_scrape_status))
+    app.add_handler(CommandHandler("upload_slots", cmd_upload_slots))
     app.add_handler(CommandHandler("services", cmd_services))
     
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_reply_message))

@@ -295,13 +295,19 @@ def write_dest_mapping(
 ):
     """Write destination mapping tags for multiple rows."""
     sheets = sheets or get_service()
-    for row_num in sheet_rows:
-        sheets.values().update(
-            spreadsheetId=scheduler_config.SPREADSHEET_ID,
-            range=f"'{tab_name}'!W{row_num}",
-            valueInputOption="RAW",
-            body={"values": [[dest_account_id]]},
-        ).execute()
+    if not sheet_rows:
+        return
+    data = [
+        {
+            "range": f"'{tab_name}'!W{row_num}",
+            "values": [[dest_account_id]],
+        }
+        for row_num in sheet_rows
+    ]
+    sheets.values().batchUpdate(
+        spreadsheetId=scheduler_config.SPREADSHEET_ID,
+        body={"valueInputOption": "RAW", "data": data},
+    ).execute()
     logger.info("Wrote dest_mapping '%s' to %d rows in %s.", dest_account_id, len(sheet_rows), tab_name)
 
 

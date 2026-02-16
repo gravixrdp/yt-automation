@@ -53,7 +53,7 @@ INSTANCE_ID = os.getenv("INSTANCE_ID", "scheduler_01")
 
 # ── Scheduler ─────────────────────────────────────────────────────
 POLL_INTERVAL_SECONDS = 60          # how often to check sheet
-MAX_CONCURRENT_WORKERS = 2          # concurrent upload workers
+MAX_CONCURRENT_WORKERS = 4          # concurrent upload workers
 UPLOADS_PER_DAY_PER_DEST = 2       # daily cap per destination account
 UPLOAD_SPACING_SECONDS = 600       # 10 min between uploads to same dest
 STALE_IN_PROGRESS_HOURS = 2        # reset rows stuck IN_PROGRESS after 2h
@@ -62,6 +62,7 @@ UPLOAD_SLOTS_LOCAL = [
     for t in os.getenv("UPLOAD_SLOTS_LOCAL", "09:00,12:00,15:00,18:00").split(",")
     if ":" in t
 ]  # daily fixed slot times in DISPLAY_TIMEZONE (hour:minute)
+UPLOAD_SLOTS_FILE = Path(__file__).parent / "upload_slots.txt"
 
 # ── Retry / Backoff ──────────────────────────────────────────────
 MAX_UPLOAD_ATTEMPTS = 3

@@ -71,6 +71,7 @@ SCRAPINGDOG_ERROR_THRESHOLD = float(os.getenv("SCRAPINGDOG_ERROR_THRESHOLD", "0.
 SCRAPINGDOG_WINDOW_SIZE = int(os.getenv("SCRAPINGDOG_WINDOW_SIZE", "100"))
 RETRY_MAX_ATTEMPTS = 3
 RETRY_BACKOFF_BASE = 2.0                # seconds: 2, 6, 18
+SCRAPER_MAX_WORKERS = int(os.getenv("SCRAPER_MAX_WORKERS", "3"))
 
 # ── Temp files ────────────────────────────────────────────────────
 TEMP_DIR = Path(f"/tmp/shorts_ingest/{INSTANCE_ID}")

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 scraper.py — Main scraper & ingestion orchestrator.
 Fetches video metadata from YouTube/Instagram sources, deduplicates,
@@ -19,8 +20,10 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import threading
 from typing import Any
 
 import yaml
@@ -240,9 +243,12 @@ def _fetch_youtube_data_api(source_id: str, max_results: int | None) -> list[dic
     url = "https://www.googleapis.com/youtube/v3/channels"
     params = {
         "part": "contentDetails",
-        "id": source_id,
         "key": scraper_config.YT_API_KEY,
     }
+    if source_id.startswith("@"):
+        params["forHandle"] = source_id.lstrip("@")
+    else:
+        params["id"] = source_id
     resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
@@ -250,8 +256,9 @@ def _fetch_youtube_data_api(source_id: str, max_results: int | None) -> list[dic
     items = data.get("items", [])
     if not items:
         # Try as username
+        params.pop("id", None)
+        params.pop("forHandle", None)
         params["forUsername"] = source_id
-        del params["id"]
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
@@ -343,7 +350,10 @@ def _fetch_youtube_data_api(source_id: str, max_results: int | None) -> list[dic
 
 def _fetch_youtube_ytdlp(source_id: str, max_results: int | None) -> list[dict]:
     """Fetch video list via yt-dlp (no download, metadata only)."""
-    channel_url = f"https://www.youtube.com/channel/{source_id}/shorts"
+    if source_id.startswith("@"):
+        channel_url = f"https://www.youtube.com/{source_id}/shorts"
+    else:
+        channel_url = f"https://www.youtube.com/channel/{source_id}/shorts"
     ytdlp_bin = _resolve_ytdlp_bin()
     if not ytdlp_bin:
         logger.error("yt-dlp not installed. Install with: pip install yt-dlp")
@@ -604,6 +614,7 @@ def process_source(
     key_rotator: KeyRotator,
     dry_run: bool = False,
     limit: int | None = None,
+    cache_lock: threading.Lock | None = None,
 ) -> dict[str, int]:
     """
     Process a single source: fetch videos, dedupe, insert rows.
@@ -628,6 +639,9 @@ def process_source(
     stats = {"fetched": 0, "inserted": 0, "skipped_duplicate": 0, "errors": 0}
     started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    if not dry_run and sheets is None:
+        sheets = scraper_sheets.get_service()
+
     if not dry_run:
         if not _acquire_scrape_lock(tab_name):
             _write_scrape_status(tab_name, {
@@ -645,7 +659,7 @@ def process_source(
 
         _write_scrape_status(tab_name, {
             "tab": tab_name,
-            "state": "running",
+            "state": "fetching",
             "started_at": started_at,
             "fetched": 0,
             "inserted": 0,
@@ -707,6 +721,16 @@ def process_source(
             })
 
         if not videos:
+            if not dry_run:
+                _write_scrape_status(tab_name, {
+                    "tab": tab_name,
+                    "state": "done",
+                    "started_at": started_at,
+                    "fetched": stats["fetched"],
+                    "inserted": stats["inserted"],
+                    "skipped_duplicate": stats["skipped_duplicate"],
+                    "errors": stats["errors"],
+                })
             return stats
 
         # Get current tab URLs for dedupe (unless dry-run)
@@ -752,12 +776,29 @@ def process_source(
 
             # Step 1: Normalize URL and check URL dedupe
             normalized_url = hash_utils.normalize_url(video["source_url"])
-            if normalized_url in tab_urls or normalized_url in url_cache:
+            if normalized_url in tab_urls:
                 logger.debug("SKIPPED_DUPLICATE (URL): %s", normalized_url)
                 log_event("skip_duplicate", reason="url", url=normalized_url)
                 stats["skipped_duplicate"] += 1
                 maybe_status_update()
                 continue
+            if cache_lock:
+                with cache_lock:
+                    if normalized_url in url_cache:
+                        logger.debug("SKIPPED_DUPLICATE (URL): %s", normalized_url)
+                        log_event("skip_duplicate", reason="url", url=normalized_url)
+                        stats["skipped_duplicate"] += 1
+                        maybe_status_update()
+                        continue
+                    url_cache.add(normalized_url)
+            else:
+                if normalized_url in url_cache:
+                    logger.debug("SKIPPED_DUPLICATE (URL): %s", normalized_url)
+                    log_event("skip_duplicate", reason="url", url=normalized_url)
+                    stats["skipped_duplicate"] += 1
+                    maybe_status_update()
+                    continue
+                url_cache.add(normalized_url)
 
             # Step 2: Attempt download + hashing
             content_hash = None
@@ -786,15 +827,29 @@ def process_source(
                 )
 
             # Step 3: Cross-tab hash dedupe
-            if content_hash in hash_cache:
-                logger.debug("SKIPPED_DUPLICATE (hash): %s", normalized_url)
-                log_event("skip_duplicate", reason="hash", url=normalized_url, hash=content_hash[:16])
-                stats["skipped_duplicate"] += 1
-                # Clean up temp file
-                if temp_path and Path(temp_path).exists():
-                    Path(temp_path).unlink()
-                maybe_status_update()
-                continue
+            if cache_lock:
+                with cache_lock:
+                    if content_hash in hash_cache:
+                        logger.debug("SKIPPED_DUPLICATE (hash): %s", normalized_url)
+                        log_event("skip_duplicate", reason="hash", url=normalized_url, hash=content_hash[:16])
+                        stats["skipped_duplicate"] += 1
+                        # Clean up temp file
+                        if temp_path and Path(temp_path).exists():
+                            Path(temp_path).unlink()
+                        maybe_status_update()
+                        continue
+                    hash_cache.add(content_hash)
+            else:
+                if content_hash in hash_cache:
+                    logger.debug("SKIPPED_DUPLICATE (hash): %s", normalized_url)
+                    log_event("skip_duplicate", reason="hash", url=normalized_url, hash=content_hash[:16])
+                    stats["skipped_duplicate"] += 1
+                    # Clean up temp file
+                    if temp_path and Path(temp_path).exists():
+                        Path(temp_path).unlink()
+                    maybe_status_update()
+                    continue
+                hash_cache.add(content_hash)
 
             # Step 4: Build row
             now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -852,9 +907,7 @@ def process_source(
                     stats["errors"] += 1
                     log_event("insert_error", tab=tab_name, row_id=next_id, error=str(e))
 
-            # Update caches
-            url_cache.add(normalized_url)
-            hash_cache.add(content_hash)
+            # Update counters
             next_id += 1
 
             # Clean up temp file
@@ -982,19 +1035,58 @@ def main():
 
     # ── Process sources ───────────────────────────────────────────
     total_stats = {"fetched": 0, "inserted": 0, "skipped_duplicate": 0, "errors": 0}
+    cache_lock = threading.Lock()
 
-    for source in sources:
-        try:
-            stats = process_source(
-                source, sheets, url_cache, hash_cache, key_rotator,
-                dry_run=args.dry_run,
-                limit=args.limit,
-            )
-            for key in total_stats:
-                total_stats[key] += stats.get(key, 0)
-        except Exception as e:
-            logger.error("Fatal error processing %s: %s", source["source_tab"], e)
-            total_stats["errors"] += 1
+    if args.source or len(sources) <= 1:
+        for source in sources:
+            try:
+                stats = process_source(
+                    source, sheets, url_cache, hash_cache, key_rotator,
+                    dry_run=args.dry_run,
+                    limit=args.limit,
+                    cache_lock=cache_lock,
+                )
+                for key in total_stats:
+                    total_stats[key] += stats.get(key, 0)
+            except Exception as e:
+                logger.error("Fatal error processing %s: %s", source["source_tab"], e)
+                total_stats["errors"] += 1
+    else:
+        insta_sources = [s for s in sources if s.get("source_type") == "instagram"]
+        other_sources = [s for s in sources if s.get("source_type") != "instagram"]
+
+        if other_sources:
+            with ThreadPoolExecutor(max_workers=scraper_config.SCRAPER_MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(
+                        process_source,
+                        source, None, url_cache, hash_cache, key_rotator,
+                        args.dry_run, args.limit, cache_lock,
+                    ): source for source in other_sources
+                }
+                for future in as_completed(futures):
+                    source = futures[future]
+                    try:
+                        stats = future.result()
+                        for key in total_stats:
+                            total_stats[key] += stats.get(key, 0)
+                    except Exception as e:
+                        logger.error("Fatal error processing %s: %s", source["source_tab"], e)
+                        total_stats["errors"] += 1
+
+        for source in insta_sources:
+            try:
+                stats = process_source(
+                    source, sheets, url_cache, hash_cache, key_rotator,
+                    dry_run=args.dry_run,
+                    limit=args.limit,
+                    cache_lock=cache_lock,
+                )
+                for key in total_stats:
+                    total_stats[key] += stats.get(key, 0)
+            except Exception as e:
+                logger.error("Fatal error processing %s: %s", source["source_tab"], e)
+                total_stats["errors"] += 1
 
     # ── Summary ───────────────────────────────────────────────────
     logger.info(

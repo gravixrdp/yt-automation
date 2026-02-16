@@ -1,13 +1,18 @@
 - source_tab: source__modox_recap
   source_type: youtube
   source_id: UC4AzlDqHa10XbeLvwN0FLZg
-  scrape_interval_minutes: 0
+  scrape_interval_minutes: 10
   max_new_per_run: 0
-  rate_limit_seconds: 3
-
+  rate_limit_seconds: 0
 - source_tab: source__apna_scenario
   source_type: youtube
   source_id: UCWz_IK_f-EaUe0DdDnSOXAQ
+  scrape_interval_minutes: 10
+  max_new_per_run: 0
+  rate_limit_seconds: 0
+- source_tab: source__not_so_kind
+  source_type: youtube
+  source_id: '@Not_so_kind'
   scrape_interval_minutes: 0
   max_new_per_run: 0
   rate_limit_seconds: 3
