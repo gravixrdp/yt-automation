@@ -23,6 +23,7 @@ import queue_db
 import oauth_helper
 import scraper_sheets
 import ai_agent
+import scraper_config
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +304,7 @@ def get_sticky_keyboard():
         ["❌ Errors", "❓ Help"],
         ["🔄 Scrape Now", "⚙️ Services"],
         ["➕ Add Source", "🧠 AI Titles"],
+        ["🧾 Scrape Status"],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
