@@ -611,13 +611,14 @@ def process_source(
     rate_limit = source.get("rate_limit_seconds", scraper_config.PER_SOURCE_RATE_LIMIT_SECONDS)
 
     stats = {"fetched": 0, "inserted": 0, "skipped_duplicate": 0, "errors": 0}
+    started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     if not dry_run:
         if not _acquire_scrape_lock(tab_name):
             _write_scrape_status(tab_name, {
                 "tab": tab_name,
                 "state": "already_running",
-                "started_at": "",
+                "started_at": started_at,
                 "fetched": 0,
                 "inserted": 0,
                 "skipped_duplicate": 0,
@@ -630,7 +631,7 @@ def process_source(
         _write_scrape_status(tab_name, {
             "tab": tab_name,
             "state": "running",
-            "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "started_at": started_at,
             "fetched": 0,
             "inserted": 0,
             "skipped_duplicate": 0,
