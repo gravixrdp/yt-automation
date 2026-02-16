@@ -10,7 +10,24 @@ cd /home/ubuntu/gravix-agent
 
 while true; do
   echo "[$(date)] Starting Scraper Run..."
-  /home/ubuntu/gravix-agent/venv/bin/python3 /home/ubuntu/gravix-agent/scraper.py --batch >> /home/ubuntu/gravix-agent/logs/scraper_loop.log 2>&1
+  # Check for per-source trigger flags (from Telegram)
+  shopt -s nullglob
+  TRIGGERED=0
+  for flag in /tmp/shorts_upload/*/trigger_scrape_*.flag /tmp/shorts_ingest/*/trigger_scrape_*.flag; do
+    TRIGGERED=1
+    tab_name=$(basename "$flag")
+    tab_name="${tab_name#trigger_scrape_}"
+    tab_name="${tab_name%.flag}"
+    echo "[$(date)] Triggered scrape for $tab_name"
+    /home/ubuntu/gravix-agent/venv/bin/python3 /home/ubuntu/gravix-agent/scraper.py --source "$tab_name" >> /home/ubuntu/gravix-agent/logs/scraper_loop.log 2>&1
+    rm -f "$flag"
+  done
+  shopt -u nullglob
+
+  # If no trigger, run batch scrape
+  if [ "$TRIGGERED" -eq 0 ]; then
+    /home/ubuntu/gravix-agent/venv/bin/python3 /home/ubuntu/gravix-agent/scraper.py --batch >> /home/ubuntu/gravix-agent/logs/scraper_loop.log 2>&1
+  fi
   
   EXIT_CODE=$?
   echo "[$(date)] Scraper finished with exit code $EXIT_CODE."
