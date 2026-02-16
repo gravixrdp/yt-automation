@@ -356,6 +356,8 @@ async def handle_reply_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await cmd_add_source_prompt(update, context)
     elif text == "🧠 AI Titles":
         await cmd_ai_prompt(update, context)
+    elif text == "🧾 Scrape Status":
+        await cmd_scrape_status(update, context)
     elif update.effective_user and update.effective_user.id in _pending_actions:
         await handle_pending_flow(update, context)
     else:
