@@ -686,98 +686,117 @@ def process_source(
         last_request_time = 0.0
         last_status_time = 0.0
 
+        def maybe_status_update():
+            nonlocal last_status_time
+            if dry_run:
+                return
+            now = time.time()
+            if now - last_status_time >= scraper_config.SCRAPE_STATUS_THROTTLE_SECONDS:
+                _write_scrape_status(tab_name, {
+                    "tab": tab_name,
+                    "state": "running",
+                    "started_at": started_at,
+                    "fetched": stats["fetched"],
+                    "inserted": stats["inserted"],
+                    "skipped_duplicate": stats["skipped_duplicate"],
+                    "errors": stats["errors"],
+                })
+                last_status_time = now
+
         iter_videos = videos if max_per_run is None else videos[:max_per_run]
         for video in iter_videos:
-        # Rate limiting
-        now = time.time()
-        elapsed = now - last_request_time
-        if elapsed < rate_limit:
-            time.sleep(rate_limit - elapsed)
-        last_request_time = time.time()
+            # Rate limiting
+            now = time.time()
+            elapsed = now - last_request_time
+            if elapsed < rate_limit:
+                time.sleep(rate_limit - elapsed)
+            last_request_time = time.time()
 
         # Step 1: Normalize URL and check URL dedupe
-        normalized_url = hash_utils.normalize_url(video["source_url"])
-        if normalized_url in tab_urls or normalized_url in url_cache:
-            logger.debug("SKIPPED_DUPLICATE (URL): %s", normalized_url)
-            log_event("skip_duplicate", reason="url", url=normalized_url)
-            stats["skipped_duplicate"] += 1
-            continue
+            normalized_url = hash_utils.normalize_url(video["source_url"])
+            if normalized_url in tab_urls or normalized_url in url_cache:
+                logger.debug("SKIPPED_DUPLICATE (URL): %s", normalized_url)
+                log_event("skip_duplicate", reason="url", url=normalized_url)
+                stats["skipped_duplicate"] += 1
+                maybe_status_update()
+                continue
 
         # Step 2: Attempt download + hashing
-        content_hash = None
-        hash_method = "metadata_hash"
-        temp_path = None
+            content_hash = None
+            hash_method = "metadata_hash"
+            temp_path = None
 
-        try:
-            temp_path = _try_download(normalized_url)
-        except Exception as e:
-            logger.warning("Download error for %s: %s", normalized_url, e)
-
-        if temp_path:
             try:
-                content_hash, hash_method = hash_utils.compute_file_hash(temp_path)
+                temp_path = _try_download(normalized_url)
             except Exception as e:
-                logger.warning("Hash error for %s: %s", temp_path, e)
-                content_hash = None
+                logger.warning("Download error for %s: %s", normalized_url, e)
 
-        if not content_hash:
-            # Fallback to metadata hash
-            content_hash, hash_method = hash_utils.compute_metadata_hash(
-                video.get("original_title", ""),
-                video.get("duration_seconds", 0),
-                video.get("published_at_utc", ""),
-                normalized_url,
-            )
+            if temp_path:
+                try:
+                    content_hash, hash_method = hash_utils.compute_file_hash(temp_path)
+                except Exception as e:
+                    logger.warning("Hash error for %s: %s", temp_path, e)
+                    content_hash = None
+
+            if not content_hash:
+                # Fallback to metadata hash
+                content_hash, hash_method = hash_utils.compute_metadata_hash(
+                    video.get("original_title", ""),
+                    video.get("duration_seconds", 0),
+                    video.get("published_at_utc", ""),
+                    normalized_url,
+                )
 
         # Step 3: Cross-tab hash dedupe
-        if content_hash in hash_cache:
-            logger.debug("SKIPPED_DUPLICATE (hash): %s", normalized_url)
-            log_event("skip_duplicate", reason="hash", url=normalized_url, hash=content_hash[:16])
-            stats["skipped_duplicate"] += 1
-            # Clean up temp file
-            if temp_path and Path(temp_path).exists():
-                Path(temp_path).unlink()
-            continue
+            if content_hash in hash_cache:
+                logger.debug("SKIPPED_DUPLICATE (hash): %s", normalized_url)
+                log_event("skip_duplicate", reason="hash", url=normalized_url, hash=content_hash[:16])
+                stats["skipped_duplicate"] += 1
+                # Clean up temp file
+                if temp_path and Path(temp_path).exists():
+                    Path(temp_path).unlink()
+                maybe_status_update()
+                continue
 
         # Step 4: Build row
-        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        auto_tags = _auto_tags_from_title(video.get("original_title", ""))
-        existing_tags = video.get("tags_from_source", "")
-        if auto_tags:
-            if existing_tags:
-                existing_tags += "," + ",".join(auto_tags)
-            else:
-                existing_tags = ",".join(auto_tags)
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            auto_tags = _auto_tags_from_title(video.get("original_title", ""))
+            existing_tags = video.get("tags_from_source", "")
+            if auto_tags:
+                if existing_tags:
+                    existing_tags += "," + ",".join(auto_tags)
+                else:
+                    existing_tags = ",".join(auto_tags)
 
-        notes = ""
-        if hash_method == "metadata_hash" and temp_path is None:
-            notes = "download_failed, metadata_hash used"
+            notes = ""
+            if hash_method == "metadata_hash" and temp_path is None:
+                notes = "download_failed, metadata_hash used"
 
-        row_data = {
-            "row_id": next_id,
-            "scraped_date_utc": now_utc,
-            "source_channel": source.get("source_id", ""),
-            "source_channel_tab": tab_name,
-            "source_url": normalized_url,
-            "original_title": video.get("original_title", ""),
-            "duration_seconds": video.get("duration_seconds", 0),
-            "published_at_utc": video.get("published_at_utc", ""),
-            "view_count": video.get("view_count", 0),
-            "thumbnail_url": video.get("thumbnail_url", ""),
-            "local_temp_path": temp_path or "",
-            "content_hash": content_hash,
-            "content_hash_method": hash_method,
-            "scraped_by": scraper_config.INSTANCE_ID,
-            "status": "PENDING",
-            "upload_attempts": 0,
-            "last_attempt_time_utc": "",
-            "notes": notes,
-            "error_log": "",
-            "tags_from_source": existing_tags,
-            "language_hint": video.get("language_hint", "unknown"),
-            "manual_flag": "none",
-            "dest_mapping_tags": "",
-        }
+            row_data = {
+                "row_id": next_id,
+                "scraped_date_utc": now_utc,
+                "source_channel": source.get("source_id", ""),
+                "source_channel_tab": tab_name,
+                "source_url": normalized_url,
+                "original_title": video.get("original_title", ""),
+                "duration_seconds": video.get("duration_seconds", 0),
+                "published_at_utc": video.get("published_at_utc", ""),
+                "view_count": video.get("view_count", 0),
+                "thumbnail_url": video.get("thumbnail_url", ""),
+                "local_temp_path": temp_path or "",
+                "content_hash": content_hash,
+                "content_hash_method": hash_method,
+                "scraped_by": scraper_config.INSTANCE_ID,
+                "status": "PENDING",
+                "upload_attempts": 0,
+                "last_attempt_time_utc": "",
+                "notes": notes,
+                "error_log": "",
+                "tags_from_source": existing_tags,
+                "language_hint": video.get("language_hint", "unknown"),
+                "manual_flag": "none",
+                "dest_mapping_tags": "",
+            }
 
             if dry_run:
                 print(f"\n{'='*60}")
@@ -804,19 +823,7 @@ def process_source(
             if temp_path and Path(temp_path).exists():
                 Path(temp_path).unlink()
 
-            if not dry_run:
-                now = time.time()
-                if now - last_status_time >= scraper_config.SCRAPE_STATUS_THROTTLE_SECONDS:
-                    _write_scrape_status(tab_name, {
-                        "tab": tab_name,
-                        "state": "running",
-                        "started_at": "",
-                        "fetched": stats["fetched"],
-                        "inserted": stats["inserted"],
-                        "skipped_duplicate": stats["skipped_duplicate"],
-                        "errors": stats["errors"],
-                    })
-                    last_status_time = now
+            maybe_status_update()
 
         # Update master_index
         if not dry_run:
