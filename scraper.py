@@ -190,7 +190,7 @@ class KeyRotator:
 
 # ── Source fetching strategies ────────────────────────────────────
 
-def _fetch_youtube_metadata(source_id: str, max_results: int = 50) -> list[dict]:
+def _fetch_youtube_metadata(source_id: str, max_results: int | None = 50) -> list[dict]:
     """
     Fetch video metadata from a YouTube channel using yt-dlp.
     Falls back to YouTube Data API if YT_API_KEY is set.
@@ -217,7 +217,7 @@ def _fetch_youtube_metadata(source_id: str, max_results: int = 50) -> list[dict]
     return videos
 
 
-def _fetch_youtube_data_api(source_id: str, max_results: int) -> list[dict]:
+def _fetch_youtube_data_api(source_id: str, max_results: int | None) -> list[dict]:
     """Fetch videos via YouTube Data API v3 with pagination."""
     import requests
 
@@ -252,8 +252,14 @@ def _fetch_youtube_data_api(source_id: str, max_results: int) -> list[dict]:
     videos_url = "https://www.googleapis.com/youtube/v3/playlistItems"
     next_page_token = None
     
-    while len(video_ids) < max_results:
-        fetch_limit = min(50, max_results - len(video_ids))
+    while True:
+        if max_results is None:
+            fetch_limit = 50
+        else:
+            remaining = max_results - len(video_ids)
+            if remaining <= 0:
+                break
+            fetch_limit = min(50, remaining)
         params = {
             "part": "contentDetails",
             "playlistId": uploads_playlist,
@@ -272,6 +278,8 @@ def _fetch_youtube_data_api(source_id: str, max_results: int) -> list[dict]:
 
         next_page_token = playlist_data.get("nextPageToken")
         if not next_page_token or not playlist_data.get("items"):
+            break
+        if max_results is not None and len(video_ids) >= max_results:
             break
 
     if not video_ids:
@@ -318,7 +326,7 @@ def _fetch_youtube_data_api(source_id: str, max_results: int) -> list[dict]:
     return videos
 
 
-def _fetch_youtube_ytdlp(source_id: str, max_results: int) -> list[dict]:
+def _fetch_youtube_ytdlp(source_id: str, max_results: int | None) -> list[dict]:
     """Fetch video list via yt-dlp (no download, metadata only)."""
     channel_url = f"https://www.youtube.com/channel/{source_id}/shorts"
     ytdlp_bin = _resolve_ytdlp_bin()
@@ -331,9 +339,11 @@ def _fetch_youtube_ytdlp(source_id: str, max_results: int) -> list[dict]:
         "--no-playlist" if "/shorts/" not in channel_url else "--yes-playlist",
         "--dump-json",
         "--no-warnings",
-        "--playlist-end", str(max_results),
         channel_url,
     ]
+    if max_results is not None:
+        cmd.insert(-1, "--playlist-end")
+        cmd.insert(-1, str(max_results))
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=120,
@@ -373,7 +383,7 @@ def _fetch_youtube_ytdlp(source_id: str, max_results: int) -> list[dict]:
     return videos
 
 
-def _fetch_instagram_metadata(source_id: str, max_results: int, key_rotator: KeyRotator) -> list[dict]:
+def _fetch_instagram_metadata(source_id: str, max_results: int | None, key_rotator: KeyRotator) -> list[dict]:
     """
     Fetch video metadata from an Instagram page via Scrapingdog.
     Falls back to basic HTML parsing if no Scrapingdog key.
@@ -425,7 +435,7 @@ def _fetch_instagram_metadata(source_id: str, max_results: int, key_rotator: Key
     return videos
 
 
-def _parse_instagram_html(html: str, source_id: str, max_results: int) -> list[dict]:
+def _parse_instagram_html(html: str, source_id: str, max_results: int | None) -> list[dict]:
     """Extract video metadata from Instagram HTML (best-effort parsing)."""
     videos = []
     # Look for video URLs in og:video or JSON-LD / shared data
@@ -434,7 +444,8 @@ def _parse_instagram_html(html: str, source_id: str, max_results: int) -> list[d
     matches = shortcode_pattern.findall(html)
     seen = set()
 
-    for code in matches[:max_results]:
+    iterable = matches if max_results is None else matches[:max_results]
+    for code in iterable:
         if code in seen:
             continue
         seen.add(code)
