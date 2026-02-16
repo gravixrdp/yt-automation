@@ -1680,6 +1680,7 @@ def create_bot_app():
     # New Control Commands
     app.add_handler(CommandHandler("set_interval", cmd_set_interval))
     app.add_handler(CommandHandler("scrape_now", cmd_scrape_now))
+    app.add_handler(CommandHandler("scrape_status", cmd_scrape_status))
     app.add_handler(CommandHandler("services", cmd_services))
     
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_reply_message))
