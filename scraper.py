@@ -712,7 +712,7 @@ def process_source(
                 time.sleep(rate_limit - elapsed)
             last_request_time = time.time()
 
-        # Step 1: Normalize URL and check URL dedupe
+            # Step 1: Normalize URL and check URL dedupe
             normalized_url = hash_utils.normalize_url(video["source_url"])
             if normalized_url in tab_urls or normalized_url in url_cache:
                 logger.debug("SKIPPED_DUPLICATE (URL): %s", normalized_url)
@@ -721,7 +721,7 @@ def process_source(
                 maybe_status_update()
                 continue
 
-        # Step 2: Attempt download + hashing
+            # Step 2: Attempt download + hashing
             content_hash = None
             hash_method = "metadata_hash"
             temp_path = None
@@ -747,7 +747,7 @@ def process_source(
                     normalized_url,
                 )
 
-        # Step 3: Cross-tab hash dedupe
+            # Step 3: Cross-tab hash dedupe
             if content_hash in hash_cache:
                 logger.debug("SKIPPED_DUPLICATE (hash): %s", normalized_url)
                 log_event("skip_duplicate", reason="hash", url=normalized_url, hash=content_hash[:16])
@@ -758,7 +758,7 @@ def process_source(
                 maybe_status_update()
                 continue
 
-        # Step 4: Build row
+            # Step 4: Build row
             now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             auto_tags = _auto_tags_from_title(video.get("original_title", ""))
             existing_tags = video.get("tags_from_source", "")
