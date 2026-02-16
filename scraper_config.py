@@ -86,6 +86,12 @@ HASH_HEADTAIL_THRESHOLD_MB = 50        # use headtail if > this
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
+# ── Scrape status / locking ──────────────────────────────────────
+SCRAPE_STATUS_DIR = LOG_DIR / "scrape_status"
+SCRAPE_STATUS_DIR.mkdir(exist_ok=True)
+SCRAPE_LOCK_TIMEOUT_MINUTES = int(os.getenv("SCRAPE_LOCK_TIMEOUT_MINUTES", "120"))
+SCRAPE_STATUS_THROTTLE_SECONDS = float(os.getenv("SCRAPE_STATUS_THROTTLE_SECONDS", "5"))
+
 # ── Sources config file ──────────────────────────────────────────
 SOURCES_YAML = Path(__file__).parent / "sources.yaml"
 
