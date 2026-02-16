@@ -661,6 +661,29 @@ def process_source(
         if not dry_run:
             scraper_sheets.ensure_tab_exists(tab_name, sheets)
 
+        # Enforce per-source scrape interval to prevent re-scrape spam
+        interval_min = int(source.get("scrape_interval_minutes", 0) or 0)
+        if not dry_run and interval_min > 0:
+            entry = scraper_sheets.get_master_index_entry(tab_name, sheets)
+            last = _parse_utc(entry.get("last_scraped_at", "") if entry else "")
+            if last:
+                elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+                if elapsed < interval_min * 60:
+                    next_allowed = (last + timedelta(minutes=interval_min)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    _write_scrape_status(tab_name, {
+                        "tab": tab_name,
+                        "state": "cooldown",
+                        "started_at": started_at,
+                        "fetched": 0,
+                        "inserted": 0,
+                        "skipped_duplicate": 0,
+                        "errors": 0,
+                        "next_allowed": next_allowed,
+                    })
+                    logger.info("Skip %s: cooldown until %s", tab_name, next_allowed)
+                    log_event("skip_cooldown", tab=tab_name, next_allowed=next_allowed)
+                    return stats
+
         # Fetch videos
         if source_type == "youtube":
             videos = _fetch_youtube_metadata(source_id, max_per_run)
