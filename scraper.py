@@ -597,48 +597,96 @@ def process_source(
     tab_name = source["source_tab"]
     source_type = source["source_type"]
     source_id = source["source_id"]
-    max_per_run = limit or source.get("max_new_per_run", 200)
+    if limit is not None:
+        max_per_run = int(limit)
+    else:
+        raw_max = source.get("max_new_per_run", None)
+        if raw_max in (None, "", 0, "0"):
+            max_per_run = None
+        else:
+            try:
+                max_per_run = int(raw_max)
+            except (TypeError, ValueError):
+                max_per_run = None
     rate_limit = source.get("rate_limit_seconds", scraper_config.PER_SOURCE_RATE_LIMIT_SECONDS)
 
     stats = {"fetched": 0, "inserted": 0, "skipped_duplicate": 0, "errors": 0}
 
+    if not dry_run:
+        if not _acquire_scrape_lock(tab_name):
+            _write_scrape_status(tab_name, {
+                "tab": tab_name,
+                "state": "already_running",
+                "started_at": "",
+                "fetched": 0,
+                "inserted": 0,
+                "skipped_duplicate": 0,
+                "errors": 0,
+            })
+            logger.info("Skip %s: scrape already running", tab_name)
+            log_event("skip_running", tab=tab_name)
+            return stats
+
+        _write_scrape_status(tab_name, {
+            "tab": tab_name,
+            "state": "running",
+            "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "fetched": 0,
+            "inserted": 0,
+            "skipped_duplicate": 0,
+            "errors": 0,
+        })
+
     logger.info("Processing source: %s (%s / %s)", tab_name, source_type, source_id)
     log_event("source_start", tab=tab_name, source_type=source_type, source_id=source_id)
 
-    # Ensure tab exists
-    if not dry_run:
-        scraper_sheets.ensure_tab_exists(tab_name, sheets)
+    try:
+        # Ensure tab exists
+        if not dry_run:
+            scraper_sheets.ensure_tab_exists(tab_name, sheets)
 
-    # Fetch videos
-    if source_type == "youtube":
-        videos = _fetch_youtube_metadata(source_id, max_per_run)
-    elif source_type == "instagram":
-        videos = _fetch_instagram_metadata(source_id, max_per_run, key_rotator)
-    else:
-        logger.error("Unknown source_type: %s", source_type)
-        return stats
+        # Fetch videos
+        if source_type == "youtube":
+            videos = _fetch_youtube_metadata(source_id, max_per_run)
+        elif source_type == "instagram":
+            videos = _fetch_instagram_metadata(source_id, max_per_run, key_rotator)
+        else:
+            logger.error("Unknown source_type: %s", source_type)
+            return stats
 
-    stats["fetched"] = len(videos)
-    logger.info("Fetched %d videos from %s", len(videos), tab_name)
+        stats["fetched"] = len(videos)
+        logger.info("Fetched %d videos from %s", len(videos), tab_name)
+        if not dry_run:
+            _write_scrape_status(tab_name, {
+                "tab": tab_name,
+                "state": "running",
+                "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "fetched": stats["fetched"],
+                "inserted": stats["inserted"],
+                "skipped_duplicate": stats["skipped_duplicate"],
+                "errors": stats["errors"],
+            })
 
-    if not videos:
-        return stats
+        if not videos:
+            return stats
 
-    # Get current tab URLs for dedupe (unless dry-run)
-    if not dry_run:
-        tab_urls = scraper_sheets.get_existing_urls(tab_name, sheets)
-    else:
-        tab_urls = url_cache
+        # Get current tab URLs for dedupe (unless dry-run)
+        if not dry_run:
+            tab_urls = scraper_sheets.get_existing_urls(tab_name, sheets)
+        else:
+            tab_urls = url_cache
 
-    # Get next row_id
-    if not dry_run:
-        next_id = scraper_sheets.get_next_row_id(tab_name, sheets)
-    else:
-        next_id = 1
+        # Get next row_id
+        if not dry_run:
+            next_id = scraper_sheets.get_next_row_id(tab_name, sheets)
+        else:
+            next_id = 1
 
-    last_request_time = 0.0
+        last_request_time = 0.0
+        last_status_time = 0.0
 
-    for video in videos[:max_per_run]:
+        iter_videos = videos if max_per_run is None else videos[:max_per_run]
+        for video in iter_videos:
         # Rate limiting
         now = time.time()
         elapsed = now - last_request_time
@@ -730,40 +778,80 @@ def process_source(
             "dest_mapping_tags": "",
         }
 
-        if dry_run:
-            print(f"\n{'='*60}")
-            print(f"DRY RUN — Row {next_id} [{tab_name}]")
-            print(f"{'='*60}")
-            print(json.dumps(row_data, indent=2, ensure_ascii=False))
-            stats["inserted"] += 1
-        else:
-            try:
-                scraper_sheets.append_row(tab_name, row_data, sheets)
+            if dry_run:
+                print(f"\n{'='*60}")
+                print(f"DRY RUN — Row {next_id} [{tab_name}]")
+                print(f"{'='*60}")
+                print(json.dumps(row_data, indent=2, ensure_ascii=False))
                 stats["inserted"] += 1
-                log_event("row_inserted", tab=tab_name, row_id=next_id, url=normalized_url)
+            else:
+                try:
+                    scraper_sheets.append_row(tab_name, row_data, sheets)
+                    stats["inserted"] += 1
+                    log_event("row_inserted", tab=tab_name, row_id=next_id, url=normalized_url)
+                except Exception as e:
+                    logger.error("Failed to insert row %d: %s", next_id, e)
+                    stats["errors"] += 1
+                    log_event("insert_error", tab=tab_name, row_id=next_id, error=str(e))
+
+            # Update caches
+            url_cache.add(normalized_url)
+            hash_cache.add(content_hash)
+            next_id += 1
+
+            # Clean up temp file
+            if temp_path and Path(temp_path).exists():
+                Path(temp_path).unlink()
+
+            if not dry_run:
+                now = time.time()
+                if now - last_status_time >= scraper_config.SCRAPE_STATUS_THROTTLE_SECONDS:
+                    _write_scrape_status(tab_name, {
+                        "tab": tab_name,
+                        "state": "running",
+                        "started_at": "",
+                        "fetched": stats["fetched"],
+                        "inserted": stats["inserted"],
+                        "skipped_duplicate": stats["skipped_duplicate"],
+                        "errors": stats["errors"],
+                    })
+                    last_status_time = now
+
+        # Update master_index
+        if not dry_run:
+            try:
+                scraper_sheets.update_master_index(tab_name, source_type, source_id, sheets)
             except Exception as e:
-                logger.error("Failed to insert row %d: %s", next_id, e)
-                stats["errors"] += 1
-                log_event("insert_error", tab=tab_name, row_id=next_id, error=str(e))
+                logger.error("Failed to update master_index: %s", e)
 
-        # Update caches
-        url_cache.add(normalized_url)
-        hash_cache.add(content_hash)
-        next_id += 1
-
-        # Clean up temp file
-        if temp_path and Path(temp_path).exists():
-            Path(temp_path).unlink()
-
-    # Update master_index
-    if not dry_run:
-        try:
-            scraper_sheets.update_master_index(tab_name, source_type, source_id, sheets)
-        except Exception as e:
-            logger.error("Failed to update master_index: %s", e)
-
-    log_event("source_complete", tab=tab_name, stats=stats)
-    return stats
+        log_event("source_complete", tab=tab_name, stats=stats)
+        if not dry_run:
+            _write_scrape_status(tab_name, {
+                "tab": tab_name,
+                "state": "done",
+                "started_at": "",
+                "fetched": stats["fetched"],
+                "inserted": stats["inserted"],
+                "skipped_duplicate": stats["skipped_duplicate"],
+                "errors": stats["errors"],
+            })
+        return stats
+    except Exception as e:
+        if not dry_run:
+            _write_scrape_status(tab_name, {
+                "tab": tab_name,
+                "state": "error",
+                "started_at": "",
+                "fetched": stats["fetched"],
+                "inserted": stats["inserted"],
+                "skipped_duplicate": stats["skipped_duplicate"],
+                "errors": stats["errors"] + 1,
+                "error": str(e),
+            })
+        raise
+    finally:
+        if not dry_run:
+            _release_scrape_lock(tab_name)
 
 
 # ── CLI ───────────────────────────────────────────────────────────
