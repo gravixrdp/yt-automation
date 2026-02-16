@@ -837,7 +837,7 @@ def process_source(
             _write_scrape_status(tab_name, {
                 "tab": tab_name,
                 "state": "done",
-                "started_at": "",
+                "started_at": started_at,
                 "fetched": stats["fetched"],
                 "inserted": stats["inserted"],
                 "skipped_duplicate": stats["skipped_duplicate"],
@@ -849,7 +849,7 @@ def process_source(
             _write_scrape_status(tab_name, {
                 "tab": tab_name,
                 "state": "error",
-                "started_at": "",
+                "started_at": started_at,
                 "fetched": stats["fetched"],
                 "inserted": stats["inserted"],
                 "skipped_duplicate": stats["skipped_duplicate"],
