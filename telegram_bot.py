@@ -233,6 +233,31 @@ def _clear_pending(uid: int):
     """Drop any stored multi-step flow state for a user."""
     _pending_actions.pop(uid, None)
 
+
+def _read_scrape_status(tab: str) -> dict | None:
+    try:
+        path = Path(scraper_config.SCRAPE_STATUS_DIR) / f"{tab}.json"
+        if not path.exists():
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _format_scrape_status(tab: str, status: dict) -> str:
+    state = status.get("state", "unknown")
+    fetched = status.get("fetched", 0)
+    inserted = status.get("inserted", 0)
+    skipped = status.get("skipped_duplicate", 0)
+    errors = status.get("errors", 0)
+    updated = status.get("updated_at", "N/A")
+    return (
+        f"📥 *{tab}* — {state}\n"
+        f"Fetched: {fetched} | Inserted: {inserted} | Skipped: {skipped} | Errors: {errors}\n"
+        f"Updated: {updated}"
+    )
+
 # ── Check if python-telegram-bot is available ─────────────────────
 try:
     from telegram import (
