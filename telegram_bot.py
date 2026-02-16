@@ -1518,6 +1518,33 @@ async def cmd_scrape_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"❌ Failed to restart service: {e}")
 
 
+@admin_only
+async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scrape_status [source_tab] — Show scraper progress/status."""
+    tabs = []
+    if context.args:
+        tabs = [context.args[0]]
+    else:
+        try:
+            sheets = sheet_manager.get_service()
+            tabs = sheet_manager.get_all_source_tabs(sheets)
+        except Exception:
+            tabs = []
+
+    if not tabs:
+        await update.effective_message.reply_text("No source tabs found.")
+        return
+
+    lines = ["🧾 *Scrape Status*"]
+    for tab in tabs[:10]:
+        status = _read_scrape_status(tab)
+        if status:
+            lines.append(_format_scrape_status(tab, status))
+        else:
+            lines.append(f"📥 *{tab}* — no status yet")
+    await update.effective_message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
 
 @admin_only
 async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
