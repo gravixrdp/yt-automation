@@ -288,6 +288,140 @@ def _write_upload_slots(slots: list[str]) -> None:
     path.write_text(",".join(slots), encoding="utf-8")
 
 
+def _uploads_paused() -> bool:
+    return scheduler_config.UPLOAD_PAUSE_FLAG_FILE.exists()
+
+
+def _set_upload_pause(paused: bool) -> None:
+    path = scheduler_config.UPLOAD_PAUSE_FLAG_FILE
+    if paused:
+        path.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+    elif path.exists():
+        path.unlink()
+
+
+def _next_upload_slot_utc(now_utc: datetime | None = None) -> datetime | None:
+    slots = _read_upload_slots()
+    parsed: list[tuple[int, int]] = []
+    for slot in slots:
+        try:
+            hour, minute = map(int, slot.split(":", 1))
+        except Exception:
+            continue
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            parsed.append((hour, minute))
+    if not parsed:
+        return None
+
+    now_utc = now_utc or datetime.now(timezone.utc)
+    tz = ZoneInfo(scheduler_config.DISPLAY_TIMEZONE)
+    now_local = now_utc.astimezone(tz)
+    day = now_local.date()
+
+    for offset in (0, 1):
+        target_day = day + timedelta(days=offset)
+        candidates: list[datetime] = []
+        for hour, minute in parsed:
+            dt_local = datetime(
+                target_day.year,
+                target_day.month,
+                target_day.day,
+                hour,
+                minute,
+                tzinfo=tz,
+            )
+            dt_utc = dt_local.astimezone(timezone.utc)
+            if dt_utc >= now_utc:
+                candidates.append(dt_utc)
+        if candidates:
+            return min(candidates)
+    return None
+
+
+def _publish_controls_markup(paused: bool):
+    toggle_label = "▶️ Resume Uploads" if paused else "⏸ Stop Uploads"
+    toggle_action = "uploads_resume" if paused else "uploads_pause"
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="publish_status"),
+            InlineKeyboardButton(toggle_label, callback_data=toggle_action),
+        ],
+        [
+            InlineKeyboardButton("🗺 Mappings", callback_data="mappings"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _build_publish_status_message() -> tuple[str, Any]:
+    paused = _uploads_paused()
+    state = "PAUSED" if paused else "RUNNING"
+    state_icon = "⏸" if paused else "▶️"
+
+    slots = _read_upload_slots()
+    next_slot_utc = _next_upload_slot_utc()
+    next_slot_local = _to_display_tz(next_slot_utc.isoformat()) if next_slot_utc else "N/A"
+    next_slot_utc_text = (
+        next_slot_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if next_slot_utc else "N/A"
+    )
+
+    stats = queue_db.get_queue_stats()
+    jobs = queue_db.get_jobs_snapshot(limit=12)
+    accounts = oauth_helper.get_all_accounts()
+    dest_name_by_id = {
+        str(a.get("account_id", "") or ""): str(a.get("account_name", "") or a.get("account_id", ""))
+        for a in accounts
+        if a.get("account_id")
+    }
+
+    lines = [
+        "📡 *Publish Monitor*",
+        f"State: {state_icon} `{state}`",
+        f"Timezone: {_md_escape(scheduler_config.DISPLAY_TIMEZONE)}",
+        f"Slots: {_md_escape(', '.join(slots) if slots else 'none')}",
+        f"Next Slot: {_md_escape(next_slot_local)} ({_md_escape(next_slot_utc_text)})",
+        f"Per Slot Limit: `{scheduler_config.UPLOADS_PER_SLOT}`",
+        "",
+        "*Queue*",
+        f"Queued: `{stats.get('queued', 0)}` | In Progress: `{stats.get('in_progress', 0)}` | Uploaded Today: `{stats.get('uploaded_today', 0)}`",
+    ]
+
+    if jobs:
+        lines.append("")
+        lines.append("*Current Targets*")
+        for job in jobs[:10]:
+            status = str(job.get("status", "") or "").upper()
+            status_icon = "🔄" if status == "IN_PROGRESS" else "⏳"
+            tab = _md_escape(str(job.get("source_tab", "") or ""))
+            row_id = int(job.get("row_id", 0) or 0)
+            dest_id = str(job.get("dest_account_id", "") or "").strip() or "unmapped"
+            dest_name = _md_escape(dest_name_by_id.get(dest_id, dest_id))
+            next_after = str(job.get("next_attempt_after", "") or "").strip()
+            wait_text = f" | {_md_escape(_to_display_tz(next_after))}" if next_after else ""
+            lines.append(
+                f"{status_icon} #{int(job.get('id', 0) or 0)} `{tab}` row `{row_id}` → {dest_name} (`{_md_escape(dest_id)}`){wait_text}"
+            )
+    else:
+        lines.append("")
+        lines.append("_No queued/in-progress publish jobs._")
+
+    try:
+        mappings = sheet_manager.get_destination_mappings(sheet_manager.get_service())
+    except Exception:
+        mappings = []
+    if mappings:
+        lines.append("")
+        lines.append("*Active Source → Destination*")
+        for mapping in mappings[:8]:
+            src = _md_escape(str(mapping.get("source_tag", "") or ""))
+            dest_id = str(mapping.get("destination_account_id", "") or "").strip()
+            dest_name = _md_escape(dest_name_by_id.get(dest_id, dest_id))
+            lines.append(f"• `{src}` → {dest_name} (`{_md_escape(dest_id)}`)")
+
+    return "\n".join(lines), _publish_controls_markup(paused)
+
+
 def _format_scrape_status(tab: str, status: dict) -> str:
     state = _md_escape(status.get("state", "unknown"))
     fetched = status.get("fetched", 0)
@@ -358,12 +492,22 @@ def get_main_menu_keyboard():
             InlineKeyboardButton("🗺 Mappings", callback_data="mappings"),
         ],
         [
+            InlineKeyboardButton("📡 Publish Status", callback_data="publish_status"),
+            InlineKeyboardButton("⏸ Stop Uploads", callback_data="uploads_pause"),
+        ],
+        [
+            InlineKeyboardButton("▶️ Resume Uploads", callback_data="uploads_resume"),
+        ],
+        [
             InlineKeyboardButton("❌ Errors", callback_data="view_errors"),
             InlineKeyboardButton("❓ Help", callback_data="help"),
         ],
         [
             InlineKeyboardButton("➕ Add Source", callback_data="src_add"),
             InlineKeyboardButton("🧠 AI Titles", callback_data="ai_menu"),
+        ],
+        [
+            InlineKeyboardButton("🧹 Cleanup Status", callback_data="cleanup_status"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -380,6 +524,9 @@ def get_sticky_keyboard():
         ["➕ Add Source", "🧠 AI Titles"],
         ["🧾 Scrape Status"],
         ["🕒 Upload Slots"],
+        ["📡 Publish Status"],
+        ["⏸ Stop Uploads", "▶️ Resume Uploads"],
+        ["🧹 Cleanup Status"],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -437,6 +584,16 @@ async def handle_reply_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await cmd_scrape_status(update, context)
     elif text == "🕒 Upload Slots":
         await cmd_upload_slots(update, context)
+    elif text == "📡 Publish Status":
+        await cmd_publish_status(update, context)
+    elif text == "⏸ Stop Uploads":
+        context.args = ["stop"]
+        await cmd_uploads(update, context)
+    elif text == "▶️ Resume Uploads":
+        context.args = ["start"]
+        await cmd_uploads(update, context)
+    elif text == "🧹 Cleanup Status":
+        await cmd_cleanup_status(update, context)
     elif update.effective_user and update.effective_user.id in _pending_actions:
         await handle_pending_flow(update, context)
     else:
@@ -457,7 +614,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = queue_db.get_queue_stats()
     accounts = oauth_helper.get_all_accounts()
     active_accounts = [a for a in accounts if a.get("token_valid")]
+    paused = _uploads_paused()
     now_display = _to_display_tz(datetime.now(timezone.utc).isoformat())
+    jobs = queue_db.get_jobs_snapshot(limit=3)
+    dest_name_by_id = {
+        str(a.get("account_id", "") or ""): str(a.get("account_name", "") or a.get("account_id", ""))
+        for a in accounts
+        if a.get("account_id")
+    }
 
     msg = (
         f"📊 *Gravix Scheduler Status*\n"
@@ -468,6 +632,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  ✅ Completed: {stats.get('completed', 0)}\n"
         f"  ❌ Failed: {stats.get('failed', 0)}\n"
         f"  📤 Uploaded Today: {stats.get('uploaded_today', 0)}\n"
+        f"  {'⏸' if paused else '▶️'} Uploads: {'PAUSED' if paused else 'RUNNING'}\n"
         f"  (Quota resets 00:00 UTC / 05:30 IST)\n\n"
         f"*Destinations:*\n"
         f"  🔗 Connected: {len(active_accounts)}/{len(accounts)}\n"
@@ -478,6 +643,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = _md_escape(acc.get("account_name", ""))
         platform = _md_escape(acc.get("platform", ""))
         msg += f"  {status_icon} {name} ({platform})\n"
+
+    if jobs:
+        msg += "\n*Current Publish Targets:*\n"
+        for job in jobs:
+            tab = _md_escape(str(job.get("source_tab", "") or ""))
+            row_id = int(job.get("row_id", 0) or 0)
+            dest_id = str(job.get("dest_account_id", "") or "").strip() or "unmapped"
+            dest_name = _md_escape(dest_name_by_id.get(dest_id, dest_id))
+            msg += f"  • `{tab}` row `{row_id}` → {dest_name}\n"
+
+    msg += "\nUse /publish_status for full live publish monitor."
 
     await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
@@ -895,6 +1071,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_errors(update, context)
     elif data == "help":
         await cmd_help(update, context)
+    elif data == "publish_status":
+        msg, markup = _build_publish_status_message()
+        try:
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=markup)
+        except Exception:
+            await query.edit_message_text(msg, reply_markup=markup)
+    elif data == "uploads_pause":
+        _set_upload_pause(True)
+        msg, markup = _build_publish_status_message()
+        prefix = "⏸ Upload workers paused."
+        try:
+            await query.edit_message_text(f"{prefix}\n\n{msg}", parse_mode="Markdown", reply_markup=markup)
+        except Exception:
+            await query.edit_message_text(f"{prefix}\n\n{msg}", reply_markup=markup)
+    elif data == "uploads_resume":
+        _set_upload_pause(False)
+        msg, markup = _build_publish_status_message()
+        prefix = "▶️ Upload workers resumed."
+        try:
+            await query.edit_message_text(f"{prefix}\n\n{msg}", parse_mode="Markdown", reply_markup=markup)
+        except Exception:
+            await query.edit_message_text(f"{prefix}\n\n{msg}", reply_markup=markup)
+    elif data == "cleanup_status":
+        await cmd_cleanup_status(update, context)
     elif data == "ai_menu":
         _pending_actions[query.from_user.id] = {"action": "ai_row"}
         await query.edit_message_text("Send the row_id here to generate AI metadata.")
@@ -1246,19 +1446,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Remove account ────────────────────────────────────────
     elif data.startswith("remove_account:"):
         account_id = data.split(":", 1)[1]
-        oauth_helper.remove_account(account_id)
-        try:
-            counts = sheet_manager.deactivate_destination(account_id)
-            canceled = queue_db.cancel_jobs_for_dest(account_id)
+        queued = queue_db.enqueue_destination_cleanup(
+            account_id,
+            remove_account_after_cleanup=True,
+        )
+        if queued:
             msg = (
-                f"Account `{account_id}` removed.\n"
-                f"Mappings disabled: {counts.get('mappings_disabled',0)}\n"
-                f"Rows unmapped: {counts.get('rows_cleared',0)}\n"
-                f"Queued jobs canceled: {canceled}"
+                f"Cleanup queued for `{_md_escape(account_id)}`.\n"
+                f"Cleanup-first mode active: account will be removed after sheet cleanup.\n"
+                f"Use `/cleanup_status` to track progress."
             )
-        except Exception as e:
-            msg = f"Account `{account_id}` removed, but sheet cleanup failed: {e}"
-        await query.edit_message_text(msg)
+        else:
+            msg = (
+                f"Cleanup already pending for `{_md_escape(account_id)}`.\n"
+                f"Cleanup-first mode active: account will be removed after sheet cleanup.\n"
+                f"Use `/cleanup_status` to track progress."
+            )
+        await query.edit_message_text(msg, parse_mode="Markdown")
 
     # ── Add source flow (callbacks) ────────────────────────────
     elif data.startswith("src_add_choose:"):
@@ -1686,10 +1890,88 @@ async def cmd_upload_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{', '.join(slots)}\n"
         f"Timezone: {scheduler_config.DISPLAY_TIMEZONE}\n\n"
         "Uploads run on these exact slot times (no random timing).\n"
+        f"Max uploads per slot: {scheduler_config.UPLOADS_PER_SLOT}\n"
         "Send new slots as CSV (HH:MM), e.g.:\n"
         "09:00,12:00,15:00,18:00"
     )
     _pending_actions[update.effective_user.id] = {"action": "set_slots"}
+
+
+@admin_only
+async def cmd_publish_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/publish_status — Show where current/next uploads are going."""
+    msg, markup = _build_publish_status_message()
+    try:
+        await update.effective_message.reply_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+    except Exception:
+        await update.effective_message.reply_text(msg, reply_markup=markup)
+
+
+@admin_only
+async def cmd_uploads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/uploads <status|stop|start> — Pause/resume upload workers."""
+    action = (context.args[0].strip().lower() if context.args else "status")
+    if action in ("stop", "pause"):
+        _set_upload_pause(True)
+        prefix = "⏸ Upload workers paused. New publishes will not run until resumed."
+    elif action in ("start", "resume", "unpause"):
+        _set_upload_pause(False)
+        prefix = "▶️ Upload workers resumed."
+    elif action in ("status", "show"):
+        prefix = "📡 Current upload control status:"
+    else:
+        await update.effective_message.reply_text(
+            "Usage: /uploads <status|stop|start>"
+        )
+        return
+
+    msg, markup = _build_publish_status_message()
+    full_msg = f"{prefix}\n\n{msg}"
+    try:
+        await update.effective_message.reply_text(
+            full_msg,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+    except Exception:
+        await update.effective_message.reply_text(full_msg, reply_markup=markup)
+
+
+@admin_only
+async def cmd_cleanup_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cleanup_status — Show destination cleanup queue status."""
+    jobs = queue_db.get_destination_cleanup_stats(limit=20)
+    if not jobs:
+        await update.effective_message.reply_text("No cleanup jobs found.")
+        return
+
+    lines = ["🧹 *Destination Cleanup Status*"]
+    for job in jobs[:10]:
+        dest = _md_escape(str(job.get("dest_account_id", "") or ""))
+        status = _md_escape(str(job.get("status", "") or ""))
+        attempts = int(job.get("attempt_count", 0) or 0)
+        rows_cleared = int(job.get("rows_cleared_total", 0) or 0)
+        mappings_disabled = int(job.get("mappings_disabled_total", 0) or 0)
+        queue_canceled = int(job.get("queue_canceled_total", 0) or 0)
+        next_retry_utc = str(job.get("next_attempt_after", "") or "").strip()
+        next_retry_local = _to_display_tz(next_retry_utc) if next_retry_utc else "N/A"
+        remove_after = "yes" if int(job.get("remove_account_after_cleanup", 0) or 0) else "no"
+        last_error = str(job.get("last_error", "") or "")
+
+        lines.append(
+            f"\n`{dest}`\n"
+            f"Status: `{status}` | Attempts: {attempts}\n"
+            f"Rows Cleared: {rows_cleared} | Mappings Disabled: {mappings_disabled} | Jobs Canceled: {queue_canceled}\n"
+            f"Next Retry: {_md_escape(next_retry_utc or 'N/A')} ({_md_escape(next_retry_local)})\n"
+            f"Remove Account After Cleanup: `{remove_after}`\n"
+            f"Last Error: {_md_escape(last_error or 'none')}"
+        )
+
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 @admin_only
@@ -1781,6 +2063,9 @@ def cmd_help_text():
         "*/scrape_now* — Trigger scraper immediately\n"
         "*/scrape_status [tab]* — Scraper progress\n"
         "*/upload_slots* — View/set upload times\n"
+        "*/publish_status* — See live publish targets (source → destination)\n"
+        "*/uploads <status|stop|start>* — Pause/resume uploads\n"
+        "*/cleanup_status* — Destination cleanup queue\n"
         "*/services <action> <target>* — Manage system\n"
         "*/add_source <platform> <channel_url_or_id>* — Quick add YouTube/Instagram source\n"
         "*/ai <row_id>* — Generate AI title/desc/hashtags for a row\n"
@@ -1829,6 +2114,9 @@ def create_bot_app():
     app.add_handler(CommandHandler("scrape_now", cmd_scrape_now))
     app.add_handler(CommandHandler("scrape_status", cmd_scrape_status))
     app.add_handler(CommandHandler("upload_slots", cmd_upload_slots))
+    app.add_handler(CommandHandler("publish_status", cmd_publish_status))
+    app.add_handler(CommandHandler("uploads", cmd_uploads))
+    app.add_handler(CommandHandler("cleanup_status", cmd_cleanup_status))
     app.add_handler(CommandHandler("services", cmd_services))
     
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_reply_message))

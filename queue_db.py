@@ -6,8 +6,6 @@ Survives restarts and tracks retry counts.
 import sqlite3
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
 
 import scheduler_config
 
@@ -73,9 +71,28 @@ def init_db():
             completed_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS destination_cleanup_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dest_account_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'QUEUED',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_after TEXT,
+            last_error TEXT,
+            rows_cleared_total INTEGER NOT NULL DEFAULT 0,
+            mappings_disabled_total INTEGER NOT NULL DEFAULT 0,
+            queue_canceled_total INTEGER NOT NULL DEFAULT 0,
+            remove_account_after_cleanup INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_queue_status ON upload_queue(status);
         CREATE INDEX IF NOT EXISTS idx_daily_dest ON daily_uploads(dest_account_id, upload_date);
         CREATE INDEX IF NOT EXISTS idx_quota_project ON youtube_quota(project_id, quota_date);
+        CREATE INDEX IF NOT EXISTS idx_cleanup_status ON destination_cleanup_jobs(status, next_attempt_after);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cleanup_active_dest
+            ON destination_cleanup_jobs(dest_account_id)
+            WHERE status IN ('QUEUED', 'IN_PROGRESS');
     """)
     conn.commit()
     conn.close()
@@ -122,6 +139,38 @@ def get_next_jobs(limit: int = 2) -> list[dict]:
                LIMIT ?""",
             (now, limit),
         ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_jobs_snapshot(
+    statuses: tuple[str, ...] = ("IN_PROGRESS", "QUEUED"),
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Return a compact snapshot of queue jobs for bot visibility/debugging.
+    IN_PROGRESS rows are sorted first, then QUEUED rows.
+    """
+    if not statuses:
+        return []
+    placeholders = ",".join("?" for _ in statuses)
+    sql = (
+        f"""SELECT id, source_tab, sheet_row, row_id, dest_account_id, status,
+                   retry_count, next_attempt_after, error_msg, created_at, updated_at
+              FROM upload_queue
+             WHERE status IN ({placeholders})
+             ORDER BY CASE status
+                        WHEN 'IN_PROGRESS' THEN 0
+                        WHEN 'QUEUED' THEN 1
+                        ELSE 2
+                      END,
+                      id ASC
+             LIMIT ?"""
+    )
+    conn = _get_conn()
+    try:
+        rows = conn.execute(sql, (*statuses, int(limit))).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -227,6 +276,215 @@ def cancel_jobs_for_dest(dest_account_id: str) -> int:
         conn.close()
 
 
+# ── Destination cleanup jobs ─────────────────────────────────────
+
+def enqueue_destination_cleanup(
+    dest_account_id: str, remove_account_after_cleanup: bool = True,
+) -> bool:
+    """
+    Queue a destination cleanup job.
+    Returns False if an active cleanup job for this destination already exists.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        try:
+            conn.execute(
+                """INSERT INTO destination_cleanup_jobs
+                   (dest_account_id, status, attempt_count, next_attempt_after, last_error,
+                    rows_cleared_total, mappings_disabled_total, queue_canceled_total,
+                    remove_account_after_cleanup, created_at, updated_at)
+                   SELECT ?, 'QUEUED', 0, NULL, NULL, 0, 0, 0, ?, ?, ?
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM destination_cleanup_jobs
+                       WHERE dest_account_id=?
+                         AND status IN ('QUEUED', 'IN_PROGRESS')
+                   )""",
+                (
+                    dest_account_id,
+                    1 if remove_account_after_cleanup else 0,
+                    now,
+                    now,
+                    dest_account_id,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        conn.commit()
+        return conn.total_changes > 0
+    finally:
+        conn.close()
+
+
+def get_next_destination_cleanup_job() -> dict | None:
+    """Return the next cleanup job ready to run, or None."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT * FROM destination_cleanup_jobs
+               WHERE status='QUEUED'
+                 AND (next_attempt_after IS NULL OR next_attempt_after <= ?)
+               ORDER BY updated_at ASC, id ASC
+               LIMIT 1""",
+            (now,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_destination_cleanup_job(job_id: int) -> dict | None:
+    """Fetch a cleanup job by id."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM destination_cleanup_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def mark_destination_cleanup_in_progress(job_id: int) -> None:
+    """Mark cleanup job in-progress and increment attempt count."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """UPDATE destination_cleanup_jobs
+               SET status='IN_PROGRESS',
+                   attempt_count=attempt_count + 1,
+                   updated_at=?
+               WHERE id=?""",
+            (now, job_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reschedule_destination_cleanup(
+    job_id: int, error_msg: str, next_attempt_after: str,
+    counters: dict | None = None,
+) -> None:
+    """Re-queue cleanup job with backoff and cumulative progress counters."""
+    counters = counters or {}
+    rows_cleared = int(counters.get("rows_cleared", 0) or 0)
+    mappings_disabled = int(counters.get("mappings_disabled", 0) or 0)
+    queue_canceled = int(counters.get("queue_canceled", 0) or 0)
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """UPDATE destination_cleanup_jobs
+               SET status='QUEUED',
+                   next_attempt_after=?,
+                   last_error=?,
+                   rows_cleared_total=rows_cleared_total + ?,
+                   mappings_disabled_total=mappings_disabled_total + ?,
+                   queue_canceled_total=queue_canceled_total + ?,
+                   updated_at=?
+               WHERE id=?""",
+            (
+                next_attempt_after,
+                error_msg,
+                rows_cleared,
+                mappings_disabled,
+                queue_canceled,
+                now,
+                job_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def complete_destination_cleanup(job_id: int, counters: dict | None = None) -> None:
+    """Mark cleanup job completed and add final progress counters."""
+    counters = counters or {}
+    rows_cleared = int(counters.get("rows_cleared", 0) or 0)
+    mappings_disabled = int(counters.get("mappings_disabled", 0) or 0)
+    queue_canceled = int(counters.get("queue_canceled", 0) or 0)
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """UPDATE destination_cleanup_jobs
+               SET status='COMPLETED',
+                   next_attempt_after=NULL,
+                   last_error=NULL,
+                   rows_cleared_total=rows_cleared_total + ?,
+                   mappings_disabled_total=mappings_disabled_total + ?,
+                   queue_canceled_total=queue_canceled_total + ?,
+                   updated_at=?
+               WHERE id=?""",
+            (
+                rows_cleared,
+                mappings_disabled,
+                queue_canceled,
+                now,
+                job_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_destination_cleanup_stats(limit: int = 20) -> list[dict]:
+    """Return recent destination cleanup jobs for status display."""
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM destination_cleanup_jobs
+               ORDER BY updated_at DESC, id DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def has_pending_destination_cleanup() -> bool:
+    """Return True if any destination cleanup job is queued or in-progress."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """SELECT 1 FROM destination_cleanup_jobs
+               WHERE status IN ('QUEUED', 'IN_PROGRESS')
+               LIMIT 1"""
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def get_destinations_with_queue_jobs(
+    statuses: tuple[str, ...] = ("QUEUED", "IN_PROGRESS", "FAILED"),
+) -> list[str]:
+    """Return distinct destination ids present in upload_queue for given statuses."""
+    if not statuses:
+        return []
+    placeholders = ",".join("?" for _ in statuses)
+    conn = _get_conn()
+    try:
+        rows = conn.execute(
+            f"""SELECT DISTINCT dest_account_id
+                FROM upload_queue
+                WHERE dest_account_id IS NOT NULL
+                  AND dest_account_id != ''
+                  AND status IN ({placeholders})""",
+            statuses,
+        ).fetchall()
+        return [r["dest_account_id"] for r in rows if r["dest_account_id"]]
+    finally:
+        conn.close()
+
+
 # ── Daily upload tracking ─────────────────────────────────────────
 
 def get_uploads_today(dest_account_id: str) -> int:
@@ -328,6 +586,31 @@ def reset_stale_jobs(hours: int = 24):
     if updated:
         logger.info("Reset %d stale IN_PROGRESS jobs.", updated)
     return updated
+
+
+def requeue_failed_status_conflicts() -> int:
+    """
+    Re-queue rows that failed only due to optimistic-lock status conflicts.
+    Useful after transient race conditions or schema-column corrections.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            """UPDATE upload_queue
+               SET status='QUEUED',
+                   retry_count=0,
+                   next_attempt_after=NULL,
+                   error_msg=NULL,
+                   updated_at=?
+               WHERE status='FAILED'
+                 AND error_msg LIKE 'status_conflict:%'""",
+            (now,),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
 
 
 def cleanup_old_records(days: int = 90):

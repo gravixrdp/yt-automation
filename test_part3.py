@@ -9,6 +9,7 @@ import os
 import tempfile
 import sqlite3
 import json
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
 os.environ["GEMINI_API_KEY"] = "test"
@@ -22,10 +23,13 @@ def test_scheduler_config():
     """Test scheduler config loads correctly."""
     import scheduler_config
     assert scheduler_config.UPLOADS_PER_DAY_PER_DEST == 2
-    assert scheduler_config.MAX_CONCURRENT_WORKERS == 2
+    assert scheduler_config.MAX_CONCURRENT_WORKERS == 4
     assert scheduler_config.POLL_INTERVAL_SECONDS == 60
     assert scheduler_config.MAX_UPLOAD_ATTEMPTS == 3
     assert scheduler_config.UPLOAD_SPACING_SECONDS == 600
+    assert scheduler_config.UPLOADS_PER_SLOT == 1
+    assert scheduler_config.CLEANUP_MAX_ROW_UPDATES_PER_CYCLE == 25
+    assert scheduler_config.CLEANUP_THROTTLE_UPLOAD_WORKERS == 1
     assert "ffmpeg" in scheduler_config.FFMPEG_DEFAULT_CMD
     assert "ffmpeg" in scheduler_config.FFMPEG_FALLBACK_CMD
     assert scheduler_config.ADMIN_TELEGRAM_IDS == [123456789]
@@ -51,8 +55,9 @@ def test_queue_db_init():
         assert "upload_queue" in table_names
         assert "daily_uploads" in table_names
         assert "last_upload_time" in table_names
+        assert "destination_cleanup_jobs" in table_names
         conn.close()
-        print("  PASS: Queue DB init (3 tables)")
+        print("  PASS: Queue DB init (cleanup table included)")
     finally:
         os.unlink(queue_db.DB_PATH)
         queue_db.DB_PATH = original_path
@@ -191,6 +196,73 @@ def test_upload_spacing():
         last = queue_db.get_last_upload_time("yt_123")
         assert last is not None
         print("  PASS: Upload spacing (last upload time)")
+    finally:
+        os.unlink(queue_db.DB_PATH)
+        queue_db.DB_PATH = original_path
+
+
+def test_destination_cleanup_enqueue_idempotent():
+    """Test destination cleanup enqueue dedupe for active jobs."""
+    import queue_db
+    original_path = queue_db.DB_PATH
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        queue_db.DB_PATH = f.name
+
+    try:
+        queue_db.init_db()
+        first = queue_db.enqueue_destination_cleanup("yt_dead_1", remove_account_after_cleanup=True)
+        second = queue_db.enqueue_destination_cleanup("yt_dead_1", remove_account_after_cleanup=True)
+        assert first is True
+        assert second is False
+        stats = queue_db.get_destination_cleanup_stats(limit=5)
+        assert len(stats) == 1
+        assert stats[0]["status"] == "QUEUED"
+        print("  PASS: Destination cleanup enqueue idempotent")
+    finally:
+        os.unlink(queue_db.DB_PATH)
+        queue_db.DB_PATH = original_path
+
+
+def test_destination_cleanup_lifecycle():
+    """Test cleanup job QUEUED -> IN_PROGRESS -> QUEUED -> COMPLETED."""
+    import queue_db
+    original_path = queue_db.DB_PATH
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        queue_db.DB_PATH = f.name
+
+    try:
+        queue_db.init_db()
+        queue_db.enqueue_destination_cleanup("yt_dead_2", remove_account_after_cleanup=False)
+        job = queue_db.get_next_destination_cleanup_job()
+        assert job is not None
+
+        queue_db.mark_destination_cleanup_in_progress(job["id"])
+        job = queue_db.get_destination_cleanup_job(job["id"])
+        assert job["status"] == "IN_PROGRESS"
+        assert job["attempt_count"] == 1
+
+        queue_db.reschedule_destination_cleanup(
+            job["id"],
+            "rate_limited",
+            datetime.now().isoformat(),
+            counters={"rows_cleared": 3, "mappings_disabled": 1, "queue_canceled": 2},
+        )
+        job = queue_db.get_destination_cleanup_job(job["id"])
+        assert job["status"] == "QUEUED"
+        assert job["rows_cleared_total"] == 3
+        assert job["mappings_disabled_total"] == 1
+        assert job["queue_canceled_total"] == 2
+
+        queue_db.mark_destination_cleanup_in_progress(job["id"])
+        queue_db.complete_destination_cleanup(
+            job["id"],
+            counters={"rows_cleared": 4, "mappings_disabled": 0, "queue_canceled": 0},
+        )
+        job = queue_db.get_destination_cleanup_job(job["id"])
+        assert job["status"] == "COMPLETED"
+        assert job["rows_cleared_total"] == 7
+        assert job["attempt_count"] == 2
+        print("  PASS: Destination cleanup lifecycle")
     finally:
         os.unlink(queue_db.DB_PATH)
         queue_db.DB_PATH = original_path
@@ -707,6 +779,8 @@ if __name__ == "__main__":
         test_queue_retry_backoff,
         test_daily_cap_tracking,
         test_upload_spacing,
+        test_destination_cleanup_enqueue_idempotent,
+        test_destination_cleanup_lifecycle,
         test_oauth_credentials_store,
         test_upload_result,
         test_uploader_factory,

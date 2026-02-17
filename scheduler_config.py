@@ -63,10 +63,18 @@ UPLOAD_SLOTS_LOCAL = [
     if ":" in t
 ]  # daily fixed slot times in DISPLAY_TIMEZONE (hour:minute)
 UPLOAD_SLOTS_FILE = Path(__file__).parent / "upload_slots.txt"
+UPLOADS_PER_SLOT = int(os.getenv("UPLOADS_PER_SLOT", "1"))
+UPLOAD_PAUSE_FLAG_FILE = Path(__file__).parent / "uploads_paused.flag"
 
 # ── Retry / Backoff ──────────────────────────────────────────────
 MAX_UPLOAD_ATTEMPTS = 3
 RETRY_BACKOFF_BASE = 2.0           # seconds: 2, 6, 18
+CLEANUP_MAX_ROW_UPDATES_PER_CYCLE = int(os.getenv("CLEANUP_MAX_ROW_UPDATES_PER_CYCLE", "25"))
+CLEANUP_RETRY_BASE_SECONDS = int(os.getenv("CLEANUP_RETRY_BASE_SECONDS", "30"))
+CLEANUP_RETRY_MAX_SECONDS = int(os.getenv("CLEANUP_RETRY_MAX_SECONDS", "1800"))
+CLEANUP_THROTTLE_UPLOAD_WORKERS = int(os.getenv("CLEANUP_THROTTLE_UPLOAD_WORKERS", "1"))
+CLEANUP_THROTTLE_PROMOTE_LIMIT = int(os.getenv("CLEANUP_THROTTLE_PROMOTE_LIMIT", "0"))
+CLEANUP_TEST_MODE = os.getenv("CLEANUP_TEST_MODE", "true").lower() == "true"
 
 # ── Paths ─────────────────────────────────────────────────────────
 TEMP_DIR = Path(f"/tmp/shorts_upload/{INSTANCE_ID}")

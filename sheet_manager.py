@@ -57,6 +57,26 @@ def _get_header_col_map(tab_name: str, sheets) -> dict[str, str]:
     return out
 
 
+def _build_col_map(tab_name: str, sheets) -> dict[str, str]:
+    """
+    Build a field -> column map with safe defaults.
+    Dynamic header positions override legacy fallback letters.
+    """
+    col_map = {
+        "status": "O",
+        "upload_attempts": "P",
+        "last_attempt_time_utc": "Q",
+        "notes": "R",
+        "error_log": "S",
+        "manual_flag": "V",
+        "dest_mapping_tags": "W",
+        # Backward compatibility when uploaded_url column doesn't exist.
+        "uploaded_url": "R",
+    }
+    col_map.update(_get_header_col_map(tab_name, sheets))
+    return col_map
+
+
 # ── Tab discovery ─────────────────────────────────────────────────
 
 def get_all_source_tabs(sheets=None) -> list[str]:
@@ -153,13 +173,16 @@ def update_row_status(
     """
     sheets = sheets or get_service()
     now = _now_utc()
+    col_map = _build_col_map(tab_name, sheets)
+    status_col = col_map.get("status", "O")
+    attempt_time_col = col_map.get("last_attempt_time_utc", "Q")
 
     # Gap #4: Optimistic locking — read-before-write
     if expected_status is not None:
         try:
             result = sheets.values().get(
                 spreadsheetId=scheduler_config.SPREADSHEET_ID,
-                range=f"'{tab_name}'!O{sheet_row}",
+                range=f"'{tab_name}'!{status_col}{sheet_row}",
             ).execute()
             current = (result.get("values", [[""]])[0][0] or "").strip().upper()
             if current and current != expected_status.upper():
@@ -172,24 +195,10 @@ def update_row_status(
             logger.warning("Lock check failed for %s row %d: %s", tab_name, sheet_row, e)
             # Proceed anyway on API errors to avoid blocking
 
-    updates = [{"range": f"'{tab_name}'!O{sheet_row}", "values": [[status]]}]
-    updates.append({"range": f"'{tab_name}'!Q{sheet_row}", "values": [[now]]})
+    updates = [{"range": f"'{tab_name}'!{status_col}{sheet_row}", "values": [[status]]}]
+    updates.append({"range": f"'{tab_name}'!{attempt_time_col}{sheet_row}", "values": [[now]]})
 
     if extra_fields:
-        # Base map for legacy scraper schema + dynamic map from actual headers.
-        col_map = {
-            "status": "O",
-            "upload_attempts": "P",
-            "last_attempt_time_utc": "Q",
-            "notes": "R",
-            "error_log": "S",
-            "manual_flag": "V",
-            "dest_mapping_tags": "W",
-            # Backward compatibility when uploaded_url column doesn't exist.
-            "uploaded_url": "R",
-        }
-        dynamic_map = _get_header_col_map(tab_name, sheets)
-        col_map.update(dynamic_map)
         for field, value in extra_fields.items():
             if field in col_map:
                 updates.append({
@@ -208,11 +217,12 @@ def append_audit_note(tab_name: str, sheet_row: int, note: str, sheets=None):
     """Append a timestamped audit note to the notes column (R)."""
     sheets = sheets or get_service()
     now = _now_utc()
+    notes_col = _build_col_map(tab_name, sheets).get("notes", "R")
     # Read existing notes
     try:
         result = sheets.values().get(
             spreadsheetId=scheduler_config.SPREADSHEET_ID,
-            range=f"'{tab_name}'!R{sheet_row}",
+            range=f"'{tab_name}'!{notes_col}{sheet_row}",
         ).execute()
         existing = result.get("values", [[""]])[0][0] if result.get("values") else ""
     except (HttpError, IndexError):
@@ -226,7 +236,7 @@ def append_audit_note(tab_name: str, sheet_row: int, note: str, sheets=None):
 
     sheets.values().update(
         spreadsheetId=scheduler_config.SPREADSHEET_ID,
-        range=f"'{tab_name}'!R{sheet_row}",
+        range=f"'{tab_name}'!{notes_col}{sheet_row}",
         valueInputOption="RAW",
         body={"values": [[combined]]},
     ).execute()
@@ -239,12 +249,13 @@ def mark_uploaded(
     """Mark a row as successfully uploaded with full metadata."""
     sheets = sheets or get_service()
     now = _now_utc()
+    attempts_col = _build_col_map(tab_name, sheets).get("upload_attempts", "P")
 
     # Read current upload_attempts
     try:
         result = sheets.values().get(
             spreadsheetId=scheduler_config.SPREADSHEET_ID,
-            range=f"'{tab_name}'!P{sheet_row}",
+            range=f"'{tab_name}'!{attempts_col}{sheet_row}",
         ).execute()
         attempts = int(result.get("values", [["0"]])[0][0] or 0)
     except (HttpError, ValueError, IndexError):
@@ -268,10 +279,11 @@ def mark_upload_error(
 ):
     """Mark a row with upload error. Set back to READY_TO_UPLOAD if retryable."""
     sheets = sheets or get_service()
+    attempts_col = _build_col_map(tab_name, sheets).get("upload_attempts", "P")
     try:
         result = sheets.values().get(
             spreadsheetId=scheduler_config.SPREADSHEET_ID,
-            range=f"'{tab_name}'!P{sheet_row}",
+            range=f"'{tab_name}'!{attempts_col}{sheet_row}",
         ).execute()
         attempts = int(result.get("values", [["0"]])[0][0] or 0)
     except (HttpError, ValueError, IndexError):
@@ -297,9 +309,10 @@ def write_dest_mapping(
     sheets = sheets or get_service()
     if not sheet_rows:
         return
+    mapping_col = _build_col_map(tab_name, sheets).get("dest_mapping_tags", "W")
     data = [
         {
-            "range": f"'{tab_name}'!W{row_num}",
+            "range": f"'{tab_name}'!{mapping_col}{row_num}",
             "values": [[dest_account_id]],
         }
         for row_num in sheet_rows
@@ -368,15 +381,17 @@ def get_uploaded_hashes_for_dest(dest_account_id: str, days: int = 30, sheets=No
     return hashes
 
 
-def deactivate_destination(dest_account_id: str, sheets=None) -> dict:
+def deactivate_destination_chunk(
+    dest_account_id: str, sheets=None, max_row_updates: int = 25,
+) -> dict:
     """
-    Disable mappings pointing to a destination and clear per-row mapping tags.
-    Returns counts: {"rows_cleared": int, "mappings_disabled": int}
+    Disable destination mappings in small idempotent chunks.
+    Returns {"done": bool, "rows_cleared": int, "mappings_disabled": int}.
     """
     sheets = sheets or get_service()
-    result = {"rows_cleared": 0, "mappings_disabled": 0}
+    result = {"done": True, "rows_cleared": 0, "mappings_disabled": 0}
 
-    # 1) Mark global mappings inactive
+    # 1) Mark global mappings inactive in a single write batch.
     try:
         resp = sheets.values().get(
             spreadsheetId=scheduler_config.SPREADSHEET_ID,
@@ -391,7 +406,9 @@ def deactivate_destination(dest_account_id: str, sheets=None) -> dict:
         updates = []
         for idx, row in enumerate(rows[1:], start=2):
             padded = row + [""] * (len(header) - len(row))
-            if len(padded) >= 2 and padded[1] == dest_account_id and padded[3].upper() == "TRUE":
+            is_match = len(padded) >= 4 and padded[1] == dest_account_id
+            is_active = padded[3].strip().upper() == "TRUE"
+            if is_match and is_active:
                 updates.append({
                     "range": f"'destinations_mapping'!D{idx}",
                     "values": [["FALSE"]],
@@ -403,45 +420,63 @@ def deactivate_destination(dest_account_id: str, sheets=None) -> dict:
             ).execute()
             result["mappings_disabled"] = len(updates)
 
-    # 2) Clear dest_mapping_tags from source tabs
+    # 2) Clear up to N row-level W mappings.
+    row_updates: list[dict] = []
     tabs = get_all_source_tabs(sheets)
-    updates: list[dict] = []
-    note_updates: list[dict] = []
     for tab in tabs:
+        mapping_col = _build_col_map(tab, sheets).get("dest_mapping_tags", "W")
         try:
             col = sheets.values().get(
                 spreadsheetId=scheduler_config.SPREADSHEET_ID,
-                range=f"'{tab}'!W2:W",
-            ).execute().get("values", [])
-            notes_col = sheets.values().get(
-                spreadsheetId=scheduler_config.SPREADSHEET_ID,
-                range=f"'{tab}'!R2:R",
+                range=f"'{tab}'!{mapping_col}2:{mapping_col}",
             ).execute().get("values", [])
         except HttpError:
             continue
+
         for i, cell in enumerate(col, start=2):
-            if cell and cell[0].strip() == dest_account_id:
-                updates.append({
-                    "range": f"'{tab}'!W{i}",
+            if len(row_updates) >= max_row_updates:
+                break
+            value = cell[0].strip() if cell and cell[0] else ""
+            if value == dest_account_id:
+                row_updates.append({
+                    "range": f"'{tab}'!{mapping_col}{i}",
                     "values": [[""]],
                 })
-                existing_note = notes_col[i-2][0] if i-2 < len(notes_col) and notes_col[i-2] else ""
-                note_val = (existing_note + "; " if existing_note else "") + "dest_removed"
-                note_updates.append({
-                    "range": f"'{tab}'!R{i}",
-                    "values": [[note_val]],
-                })
-    if updates:
-        sheets.values().batchUpdate(
-            spreadsheetId=scheduler_config.SPREADSHEET_ID,
-            body={"valueInputOption": "RAW", "data": updates},
-        ).execute()
-        result["rows_cleared"] = len(updates)
-    if note_updates:
-        sheets.values().batchUpdate(
-            spreadsheetId=scheduler_config.SPREADSHEET_ID,
-            body={"valueInputOption": "RAW", "data": note_updates},
-        ).execute()
 
-    logger.info("Deactivated dest %s: %s", dest_account_id, result)
+        if len(row_updates) >= max_row_updates:
+            break
+
+    if row_updates:
+        sheets.values().batchUpdate(
+            spreadsheetId=scheduler_config.SPREADSHEET_ID,
+            body={"valueInputOption": "RAW", "data": row_updates},
+        ).execute()
+        result["rows_cleared"] = len(row_updates)
+
+    # If we hit the chunk limit, force another pass to guarantee completion.
+    if result["rows_cleared"] >= max_row_updates:
+        result["done"] = False
+
+    logger.info("Deactivated chunk for %s: %s", dest_account_id, result)
     return result
+
+
+def deactivate_destination(dest_account_id: str, sheets=None) -> dict:
+    """
+    Backward-compatible full cleanup helper.
+    Executes chunked cleanup until completion.
+    """
+    sheets = sheets or get_service()
+    total = {"rows_cleared": 0, "mappings_disabled": 0}
+    while True:
+        chunk = deactivate_destination_chunk(
+            dest_account_id,
+            sheets=sheets,
+            max_row_updates=max(1, scheduler_config.CLEANUP_MAX_ROW_UPDATES_PER_CYCLE),
+        )
+        total["rows_cleared"] += int(chunk.get("rows_cleared", 0) or 0)
+        total["mappings_disabled"] += int(chunk.get("mappings_disabled", 0) or 0)
+        if chunk.get("done", True):
+            break
+    logger.info("Deactivated destination %s: %s", dest_account_id, total)
+    return total

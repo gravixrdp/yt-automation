@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import logging
+import random
 import re
 import signal
 import sys
@@ -294,6 +295,88 @@ def _first_slot_tomorrow(now_utc: datetime | None = None) -> datetime:
     return now_utc + timedelta(hours=24)
 
 
+def _cleanup_pressure_mode() -> bool:
+    """Whether cleanup testing mode should throttle write-heavy behavior."""
+    if not scheduler_config.CLEANUP_TEST_MODE:
+        return False
+    return queue_db.has_pending_destination_cleanup()
+
+
+def _uploads_paused() -> bool:
+    """Upload execution pause toggle controlled by Telegram bot."""
+    return scheduler_config.UPLOAD_PAUSE_FLAG_FILE.exists()
+
+
+def _cleanup_backoff_seconds(attempt_count: int) -> int:
+    """Exponential backoff with jitter for cleanup retries."""
+    attempt = max(1, int(attempt_count or 1))
+    base = max(1, scheduler_config.CLEANUP_RETRY_BASE_SECONDS)
+    cap = max(base, scheduler_config.CLEANUP_RETRY_MAX_SECONDS)
+    delay = min(cap, base * (2 ** (attempt - 1)))
+    jitter = random.uniform(0, max(1.0, delay * 0.2))
+    return int(min(cap, delay + jitter))
+
+
+def _maybe_append_audit_note(tab_name: str, sheet_row: int, note: str, sheets) -> None:
+    """Skip non-essential audit writes while cleanup jobs are pending."""
+    if _cleanup_pressure_mode():
+        return
+    try:
+        sheet_manager.append_audit_note(tab_name, sheet_row, note, sheets)
+    except Exception:
+        pass
+
+
+def _promote_pending_with_mapping(sheets, global_map: dict[str, str], max_promote: int = 15) -> int:
+    """
+    Move mapped PENDING rows to READY_TO_UPLOAD so scheduler can enqueue them.
+    Uses row-level mapping if present, else global tab mapping, else static mapping.
+    """
+    if max_promote <= 0:
+        return 0
+    promoted = 0
+    tabs = sheet_manager.get_all_source_tabs(sheets)
+    for tab in tabs:
+        try:
+            pending_rows = sheet_manager.read_rows_by_status(tab, "PENDING", sheets)
+        except Exception as e:
+            logger.warning("Could not read PENDING rows for %s: %s", tab, e)
+            continue
+
+        for row in pending_rows:
+            manual_flag = str(row.get("manual_flag", "") or "").strip().lower()
+            if manual_flag == "review":
+                continue
+
+            dest = str(row.get("dest_mapping_tags", "") or "").strip()
+            if not dest and tab in global_map:
+                dest = global_map[tab]
+            if not dest and tab in scheduler_config.STATIC_MAPPINGS:
+                dest = scheduler_config.STATIC_MAPPINGS[tab]
+            if not dest:
+                continue  # still unmapped
+
+            sheet_row = row.get("_sheet_row")
+            if not sheet_row:
+                continue
+
+            if promoted >= max_promote:
+                return promoted
+
+            try:
+                sheet_manager.update_row_status(
+                    tab,
+                    sheet_row,
+                    "READY_TO_UPLOAD",
+                    {"dest_mapping_tags": dest},
+                    sheets=sheets,
+                )
+                promoted += 1
+            except Exception as e:
+                logger.warning("Promote failed for %s!W%d: %s", tab, sheet_row, e)
+    return promoted
+
+
 # ── Core scheduler logic ─────────────────────────────────────────
 
 def poll_and_enqueue(sheets=None):
@@ -301,7 +384,21 @@ def poll_and_enqueue(sheets=None):
     Scan all source tabs for READY_TO_UPLOAD rows and add them to the queue.
     Respects per-destination daily caps.
     """
+    if _uploads_paused():
+        logger.info("Uploads paused by admin flag; skipping poll/enqueue.")
+        log_event("poll_skipped_paused")
+        return 0
+
     sheets = sheets or sheet_manager.get_service()
+    cleanup_mode = _cleanup_pressure_mode()
+    # Load dynamic tab-level mappings from Sheet (used for promotion + enqueue)
+    global_mappings_list = sheet_manager.get_destination_mappings(sheets)
+    global_map = {m["source_tag"]: m["destination_account_id"] for m in global_mappings_list}
+
+    # Auto-promote PENDING rows that already have a mapping (row/global/static) and are not flagged.
+    max_promote = scheduler_config.CLEANUP_THROTTLE_PROMOTE_LIMIT if cleanup_mode else 15
+    promoted = _promote_pending_with_mapping(sheets, global_map, max_promote=max_promote)
+
     ready_rows = sheet_manager.read_ready_rows(sheets)
 
     enqueued = 0
@@ -310,10 +407,6 @@ def poll_and_enqueue(sheets=None):
     skipped_schedule = 0
     skipped_attempts = 0
     now_utc = datetime.now(timezone.utc)
-
-    # Load dynamic tab-level mappings from Sheet
-    global_mappings_list = sheet_manager.get_destination_mappings(sheets)
-    global_map = {m["source_tag"]: m["destination_account_id"] for m in global_mappings_list}
 
     for row in ready_rows:
         row_id = int(row.get("row_id", 0) or 0)
@@ -371,7 +464,7 @@ def poll_and_enqueue(sheets=None):
                     "Skipping row %d — dest %s at daily cap (%d/%d)",
                     row_id, dest, today_count, scheduler_config.UPLOADS_PER_DAY_PER_DEST,
                 )
-                sheet_manager.append_audit_note(
+                _maybe_append_audit_note(
                     tab_name, sheet_row, f"scheduler: quota_reached_today for {dest}", sheets,
                 )
                 skipped_cap += 1
@@ -390,12 +483,13 @@ def poll_and_enqueue(sheets=None):
             enqueued += 1
 
     logger.info(
-        "Poll: %d ready rows, %d enqueued, %d capped, %d flagged, %d scheduled, %d max-attempt.",
-        len(ready_rows), enqueued, skipped_cap, skipped_flag, skipped_schedule, skipped_attempts,
+        "Poll: %d ready rows, %d enqueued, %d capped, %d flagged, %d scheduled, %d max-attempt, %d promoted.",
+        len(ready_rows), enqueued, skipped_cap, skipped_flag, skipped_schedule, skipped_attempts, promoted,
     )
     log_event("poll_complete", ready=len(ready_rows), enqueued=enqueued,
               skipped_cap=skipped_cap, skipped_flag=skipped_flag,
-              skipped_schedule=skipped_schedule, skipped_attempts=skipped_attempts)
+              skipped_schedule=skipped_schedule, skipped_attempts=skipped_attempts,
+              promoted=promoted, cleanup_mode=cleanup_mode)
     return enqueued
 
 
@@ -431,12 +525,29 @@ def process_upload_job(job: dict) -> dict:
             tab_name, sheet_row, "IN_PROGRESS", sheets=sheets, expected_status="READY_TO_UPLOAD"
         )
     except ValueError as e:
-        error = f"status_conflict: {e}"
-        queue_db.mark_failed(queue_id, error, max_retries=0)
-        result["error"] = error
-        return result
-    sheet_manager.append_audit_note(tab_name, sheet_row,
-                                    f"scheduler: upload started (dest={dest_account_id})", sheets)
+        conflict_text = str(e).upper()
+        if "ACTUAL=IN_PROGRESS" in conflict_text:
+            logger.info(
+                "Row already IN_PROGRESS for queued job %d (%s row %d); continuing.",
+                queue_id, tab_name, sheet_row,
+            )
+        else:
+            error = f"status_conflict: {e}"
+            queue_db.mark_failed(queue_id, error, max_retries=scheduler_config.MAX_UPLOAD_ATTEMPTS)
+            _maybe_append_audit_note(
+                tab_name,
+                sheet_row,
+                f"scheduler: status conflict, will retry ({error[:120]})",
+                sheets,
+            )
+            result["status"] = "deferred_status_conflict"
+            result["error"] = error
+            return result
+    _maybe_append_audit_note(
+        tab_name, sheet_row,
+        f"scheduler: upload started (dest={dest_account_id})",
+        sheets,
+    )
 
     # Step 2: Read full row data
     row_data = sheet_manager.read_row(tab_name, sheet_row, sheets)
@@ -520,6 +631,16 @@ def process_upload_job(job: dict) -> dict:
     if uploads_today >= scheduler_config.UPLOADS_PER_DAY_PER_DEST:
         tomorrow_slot = _first_slot_tomorrow(now_utc)
         queue_db.requeue_at(queue_id, tomorrow_slot.isoformat())
+        try:
+            sheet_manager.update_row_status(
+                tab_name,
+                sheet_row,
+                "READY_TO_UPLOAD",
+                sheets=sheets,
+                expected_status="IN_PROGRESS",
+            )
+        except ValueError:
+            pass
         result["status"] = "deferred_slot_cap"
         result["slot_time"] = tomorrow_slot.isoformat()
         return result
@@ -528,13 +649,21 @@ def process_upload_job(job: dict) -> dict:
     if now_utc < slot_time:
         queue_db.requeue_at(queue_id, slot_time.isoformat())
         try:
-            sheet_manager.append_audit_note(
-                tab_name, sheet_row,
-                f"scheduler: waiting for slot {slot_time.astimezone(ZoneInfo(scheduler_config.DISPLAY_TIMEZONE)).strftime('%H:%M %Z')}",
-                sheets,
+            sheet_manager.update_row_status(
+                tab_name,
+                sheet_row,
+                "READY_TO_UPLOAD",
+                sheets=sheets,
+                expected_status="IN_PROGRESS",
             )
-        except Exception:
+        except ValueError:
             pass
+        _maybe_append_audit_note(
+            tab_name,
+            sheet_row,
+            f"scheduler: waiting for slot {slot_time.astimezone(ZoneInfo(scheduler_config.DISPLAY_TIMEZONE)).strftime('%H:%M %Z')}",
+            sheets,
+        )
         result["status"] = "deferred_slot_wait"
         result["slot_time"] = slot_time.isoformat()
         return result
@@ -616,7 +745,7 @@ def process_upload_job(job: dict) -> dict:
         pass
 
     if optimized.get("source") != "sheet":
-        sheet_manager.append_audit_note(
+        _maybe_append_audit_note(
             tab_name, sheet_row, f"scheduler: metadata source={optimized.get('source')}", sheets
         )
 
@@ -705,16 +834,110 @@ def process_upload_job(job: dict) -> dict:
     return result
 
 
-def run_workers():
+def run_destination_cleanup_jobs(sheets=None) -> int:
+    """
+    Process one destination cleanup job per cycle.
+    Retry until success with bounded backoff.
+    """
+    job = queue_db.get_next_destination_cleanup_job()
+    if not job:
+        return 0
+
+    sheets = sheets or sheet_manager.get_service()
+    job_id = int(job["id"])
+    dest_account_id = str(job.get("dest_account_id", "") or "").strip()
+    queue_db.mark_destination_cleanup_in_progress(job_id)
+    job_state = queue_db.get_destination_cleanup_job(job_id) or job
+
+    counters = {
+        "rows_cleared": 0,
+        "mappings_disabled": 0,
+        "queue_canceled": 0,
+    }
+
+    try:
+        canceled = queue_db.cancel_jobs_for_dest(dest_account_id)
+        counters["queue_canceled"] = int(canceled or 0)
+
+        chunk = sheet_manager.deactivate_destination_chunk(
+            dest_account_id,
+            sheets=sheets,
+            max_row_updates=max(1, scheduler_config.CLEANUP_MAX_ROW_UPDATES_PER_CYCLE),
+        )
+        counters["rows_cleared"] = int(chunk.get("rows_cleared", 0) or 0)
+        counters["mappings_disabled"] = int(chunk.get("mappings_disabled", 0) or 0)
+
+        if chunk.get("done", False):
+            if bool(job_state.get("remove_account_after_cleanup", 1)):
+                oauth_helper.remove_account(dest_account_id)
+            queue_db.complete_destination_cleanup(job_id, counters)
+            logger.info("Destination cleanup completed for %s", dest_account_id)
+            log_event(
+                "dest_cleanup_completed",
+                destination=dest_account_id,
+                rows_cleared=counters["rows_cleared"],
+                mappings_disabled=counters["mappings_disabled"],
+                queue_canceled=counters["queue_canceled"],
+            )
+        else:
+            delay = _cleanup_backoff_seconds(int(job_state.get("attempt_count", 1) or 1))
+            next_attempt = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+            queue_db.reschedule_destination_cleanup(
+                job_id,
+                "cleanup_incomplete_next_chunk",
+                next_attempt,
+                counters=counters,
+            )
+            logger.info(
+                "Destination cleanup partial for %s; retrying in %ds",
+                dest_account_id, delay,
+            )
+            log_event(
+                "dest_cleanup_rescheduled",
+                destination=dest_account_id,
+                reason="chunk_incomplete",
+                delay_seconds=delay,
+                rows_cleared=counters["rows_cleared"],
+                mappings_disabled=counters["mappings_disabled"],
+                queue_canceled=counters["queue_canceled"],
+            )
+    except Exception as e:
+        delay = _cleanup_backoff_seconds(int(job_state.get("attempt_count", 1) or 1))
+        next_attempt = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+        queue_db.reschedule_destination_cleanup(
+            job_id,
+            f"{type(e).__name__}: {e}",
+            next_attempt,
+            counters=counters,
+        )
+        logger.warning(
+            "Destination cleanup failed for %s; retrying in %ds (%s)",
+            dest_account_id, delay, e,
+        )
+        log_event(
+            "dest_cleanup_error",
+            destination=dest_account_id,
+            error=f"{type(e).__name__}: {e}",
+            delay_seconds=delay,
+            rows_cleared=counters["rows_cleared"],
+            mappings_disabled=counters["mappings_disabled"],
+            queue_canceled=counters["queue_canceled"],
+        )
+    return 1
+
+
+def run_workers(max_workers: int | None = None):
     """Pull jobs from queue and process them with a thread pool."""
-    jobs = queue_db.get_next_jobs(limit=scheduler_config.MAX_CONCURRENT_WORKERS)
+    worker_count = max_workers or scheduler_config.MAX_CONCURRENT_WORKERS
+    worker_count = max(1, int(worker_count))
+    jobs = queue_db.get_next_jobs(limit=worker_count)
     if not jobs:
         return 0
 
     logger.info("Processing %d upload jobs...", len(jobs))
     results = []
 
-    with ThreadPoolExecutor(max_workers=scheduler_config.MAX_CONCURRENT_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = {executor.submit(process_upload_job, job): job for job in jobs}
         for future in as_completed(futures):
             try:
@@ -741,6 +964,7 @@ def reconcile(sheets=None):
     """
     logger.info("Running reconciliation...")
     stale = queue_db.reset_stale_jobs(scheduler_config.STALE_IN_PROGRESS_HOURS)
+    conflict_requeued = queue_db.requeue_failed_status_conflicts()
     queue_db.cleanup_old_records(days=90)
     download_manager.cleanup_old_temp_files()
 
@@ -763,8 +987,30 @@ def reconcile(sheets=None):
     except Exception as e:
         logger.error("Token refresh error: %s", e)
 
+    # Self-heal: queue cleanup for destination ids that still exist in queue
+    # but are no longer present in credentials.
+    queued_destinations = queue_db.get_destinations_with_queue_jobs()
+    known_accounts = {a.get("account_id", "") for a in oauth_helper.get_all_accounts()}
+    orphan_enqueued = 0
+    for dest in queued_destinations:
+        if dest and dest not in known_accounts:
+            if queue_db.enqueue_destination_cleanup(dest, remove_account_after_cleanup=False):
+                orphan_enqueued += 1
+    if orphan_enqueued:
+        logger.info("Queued %d orphan destination cleanup jobs during reconcile.", orphan_enqueued)
+        log_event("dest_cleanup_reconcile_enqueued", count=orphan_enqueued)
+
+    if conflict_requeued:
+        logger.info("Re-queued %d jobs that were failed with status_conflict.", conflict_requeued)
+        log_event("requeue_status_conflicts", count=conflict_requeued)
+
     logger.info("Reconciliation done (reset %d stale jobs).", stale)
-    log_event("reconciliation", stale_reset=stale)
+    log_event(
+        "reconciliation",
+        stale_reset=stale,
+        orphan_cleanup_enqueued=orphan_enqueued,
+        status_conflict_requeued=conflict_requeued,
+    )
 
 
 def _cleanup_old_logs():
@@ -829,9 +1075,19 @@ def main():
 
     if args.once:
         # Single cycle
+        run_destination_cleanup_jobs()
         enqueued = poll_and_enqueue()
-        if enqueued:
-            run_workers()
+        if _uploads_paused():
+            logger.info("Uploads paused by admin; skipping worker execution.")
+            log_event("workers_skipped_paused")
+        elif enqueued or queue_db.get_queue_stats().get("queued", 0) > 0:
+            worker_limit = (
+                scheduler_config.CLEANUP_THROTTLE_UPLOAD_WORKERS
+                if _cleanup_pressure_mode()
+                else scheduler_config.MAX_CONCURRENT_WORKERS
+            )
+            worker_limit = min(worker_limit, max(1, scheduler_config.UPLOADS_PER_SLOT))
+            run_workers(max_workers=worker_limit)
         return
 
     # ── Continuous polling loop ─────────────────────────────────────
@@ -840,13 +1096,25 @@ def main():
 
     while not _shutdown_event.is_set():
         try:
+            # Cleanup-first ordering for destination removals.
+            run_destination_cleanup_jobs()
+
             # Poll and enqueue
             enqueued = poll_and_enqueue()
 
             # Process queued jobs (skip if shutting down)
             if not _shutdown_event.is_set():
-                if enqueued or queue_db.get_queue_stats().get("queued", 0) > 0:
-                    run_workers()
+                if _uploads_paused():
+                    logger.info("Uploads paused by admin; skipping worker execution.")
+                    log_event("workers_skipped_paused")
+                elif enqueued or queue_db.get_queue_stats().get("queued", 0) > 0:
+                    worker_limit = (
+                        scheduler_config.CLEANUP_THROTTLE_UPLOAD_WORKERS
+                        if _cleanup_pressure_mode()
+                        else scheduler_config.MAX_CONCURRENT_WORKERS
+                    )
+                    worker_limit = min(worker_limit, max(1, scheduler_config.UPLOADS_PER_SLOT))
+                    run_workers(max_workers=worker_limit)
 
             # Sleep until next poll (interruptible by shutdown)
             _shutdown_event.wait(timeout=scheduler_config.POLL_INTERVAL_SECONDS)
