@@ -653,9 +653,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dest_name = _md_escape(dest_name_by_id.get(dest_id, dest_id))
             msg += f"  • `{tab}` row `{row_id}` → {dest_name}\n"
 
-    msg += "\nUse /publish_status for full live publish monitor."
+    msg += "\nUse `/publish_status` for full live publish monitor."
 
-    await update.effective_message.reply_text(msg, parse_mode="Markdown")
+    try:
+        await update.effective_message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        # Keep status command reliable even if Telegram markdown parsing changes.
+        if "Can't parse entities" in str(e):
+            await update.effective_message.reply_text(msg)
+        else:
+            raise
 
 
 @admin_only
@@ -2137,14 +2144,6 @@ def run_bot():
     
     # Note: run_polling() is blocking.
     app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        level=logging.INFO
-    )
-    run_bot()
 
 
 if __name__ == "__main__":
